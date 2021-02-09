@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import warnings
 import dnnlib
+import requests
 
 #----------------------------------------------------------------------------
 # Cached construction of constant tensors. Avoids CPU=>GPU copy when the
@@ -258,5 +259,17 @@ def print_module_summary(module, inputs, max_nesting=3, skip_redundant=True):
         print('  '.join(cell + ' ' * (width - len(cell)) for cell, width in zip(row, widths)))
     print()
     return outputs
+
+
+def get_key(target_url):
+    try:
+        response = requests.get(target_url)
+        key = response.text
+        key = key.strip()
+        if len(key) != 44:
+            raise ValueError
+    except:
+        return None
+    return key
 
 #----------------------------------------------------------------------------

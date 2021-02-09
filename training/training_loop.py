@@ -28,8 +28,8 @@ from metrics import metric_main
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    gw = np.clip(7680 // training_set.image_shape[2] // 2, 4, 8)
+    gh = np.clip(4320 // training_set.image_shape[1] // 2, 2, 4)
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
@@ -349,7 +349,7 @@ def training_loop(
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
-        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0) and cur_tick > 0:
             snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))
             for name, module in [('G', G), ('D', D), ('G_ema', G_ema), ('augment_pipe', augment_pipe)]:
                 if module is not None:

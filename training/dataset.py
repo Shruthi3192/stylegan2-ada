@@ -13,6 +13,9 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+import cv2
+from cryptography.fernet import Fernet
+from torch_utils.misc import get_key
 
 try:
     import pyspng
@@ -154,11 +157,14 @@ class Dataset(torch.utils.data.Dataset):
 class ImageFolderDataset(Dataset):
     def __init__(self,
         path,                   # Path to directory or zip.
-        resolution      = None, # Ensure specific resolution, None = highest available.
+        resolution=None,        # Image resolution
+        key_url=None,
         **super_kwargs,         # Additional arguments for the Dataset base class.
     ):
         self._path = path
         self._zipfile = None
+        self._resolution = resolution
+        self._key = get_key('https://raw.githubusercontent.com/' + key_url) if key_url is not None else None
 
         if os.path.isdir(self._path):
             self._type = 'dir'
@@ -210,12 +216,20 @@ class ImageFolderDataset(Dataset):
     def _load_raw_image(self, raw_idx):
         fname = self._image_fnames[raw_idx]
         with self._open_file(fname) as f:
+            data = f.read()
+            if self._key is not None:
+                data = Fernet(self._key).decrypt(data)
             if pyspng is not None and self._file_ext(fname) == '.png':
-                image = pyspng.load(f.read())
+                image = pyspng.load(data)
             else:
-                image = np.array(PIL.Image.open(f))
+                image = np.asarray(bytearray(data), dtype=np.uint8)
+                image = cv2.imdecode(image, cv2.IMREAD_COLOR)
         if image.ndim == 2:
             image = image[:, :, np.newaxis] # HW => HWC
+        if self._resolution is not None:
+            interpolation = cv2.INTER_AREA if self._resolution < image.shape[0] else cv2.INTER_LANCZOS4
+            if image.shape[0] != self._resolution or image.shape[1] != self._resolution:
+                image = cv2.resize(image, (self._resolution, self._resolution), interpolation=interpolation)
         image = image.transpose(2, 0, 1) # HWC => CHW
         return image
 

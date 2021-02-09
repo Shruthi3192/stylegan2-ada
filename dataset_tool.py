@@ -22,6 +22,10 @@ import click
 import numpy as np
 import PIL.Image
 from tqdm import tqdm
+import cv2
+import random
+from cryptography.fernet import Fernet
+import itertools
 
 #----------------------------------------------------------------------------
 
@@ -50,7 +54,14 @@ def is_image_ext(fname: Union[str, Path]) -> bool:
 #----------------------------------------------------------------------------
 
 def open_image_folder(source_dir, *, max_images: Optional[int]):
-    input_images = [str(f) for f in sorted(Path(source_dir).rglob('*')) if is_image_ext(f) and os.path.isfile(f)]
+
+    if os.path.isfile(os.path.join(source_dir, 'images_list.txt')):
+        with open(os.path.join(source_dir, 'images_list.txt')) as fp:
+            input_images = fp.read().splitlines()
+        random.shuffle(input_images)
+        input_images = [os.path.join(source_dir, name) for name in input_images]
+    else:
+        input_images = [str(f) for f in sorted(Path(source_dir).rglob('*')) if is_image_ext(f) and os.path.isfile(f)]
 
     # Load labels.
     labels = {}
@@ -69,7 +80,9 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
         for idx, fname in enumerate(input_images):
             arch_fname = os.path.relpath(fname, source_dir)
             arch_fname = arch_fname.replace('\\', '/')
-            img = np.array(PIL.Image.open(fname))
+            # img = np.array(PIL.Image.open(fname))
+            img = cv2.imread(fname, cv2.IMREAD_COLOR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             yield dict(img=img, label=labels.get(arch_fname))
             if idx >= max_idx-1:
                 break
@@ -97,8 +110,13 @@ def open_image_zip(source, *, max_images: Optional[int]):
         with zipfile.ZipFile(source, mode='r') as z:
             for idx, fname in enumerate(input_images):
                 with z.open(fname, 'r') as file:
-                    img = PIL.Image.open(file) # type: ignore
-                    img = np.array(img)
+                    # img = PIL.Image.open(file) # type: ignore
+                    # img = np.array(img)
+                    img = np.asarray(bytearray(file.read()), dtype='uint8')
+                    img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+                    # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # img = cv2.imread(file, 1)
+                # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 yield dict(img=img, label=labels.get(fname))
                 if idx >= max_idx-1:
                     break
@@ -202,24 +220,30 @@ def make_transform(
     output_height: Optional[int],
     resize_filter: str
 ) -> Callable[[np.ndarray], Optional[np.ndarray]]:
-    resample = { 'box': PIL.Image.BOX, 'lanczos': PIL.Image.LANCZOS }[resize_filter]
+    # resample = { 'box': PIL.Image.BOX, 'lanczos': PIL.Image.LANCZOS }[resize_filter]
+    resample = { 'box': cv2.INTER_NEAREST, 'lanczos': cv2.INTER_LANCZOS4 }[resize_filter]
+
     def scale(width, height, img):
         w = img.shape[1]
         h = img.shape[0]
         if width == w and height == h:
             return img
-        img = PIL.Image.fromarray(img)
+        # img = PIL.Image.fromarray(img)
         ww = width if width is not None else w
         hh = height if height is not None else h
-        img = img.resize((ww, hh), resample)
-        return np.array(img)
+        # img = img.resize((ww, hh), resample)
+        img = cv2.resize(img, (ww, hh), interpolation=resample)
+        # return np.array(img)
+        return img
 
     def center_crop(width, height, img):
         crop = np.min(img.shape[:2])
         img = img[(img.shape[0] - crop) // 2 : (img.shape[0] + crop) // 2, (img.shape[1] - crop) // 2 : (img.shape[1] + crop) // 2]
-        img = PIL.Image.fromarray(img, 'RGB')
-        img = img.resize((width, height), resample)
-        return np.array(img)
+        # img = PIL.Image.fromarray(img, 'RGB')
+        # img = img.resize((width, height), resample)
+        img = cv2.resize(img, (width, height), interpolation=resample)
+        # return np.array(img)
+        return img
 
     def center_crop_wide(width, height, img):
         ch = int(np.round(width * img.shape[0] / img.shape[1]))
@@ -227,9 +251,10 @@ def make_transform(
             return None
 
         img = img[(img.shape[0] - ch) // 2 : (img.shape[0] + ch) // 2]
-        img = PIL.Image.fromarray(img, 'RGB')
-        img = img.resize((width, height), resample)
-        img = np.array(img)
+        # img = PIL.Image.fromarray(img, 'RGB')
+        # img = img.resize((width, height), resample)
+        # img = np.array(img)
+        img = cv2.resize(img, (width, height), interpolation=resample)
 
         canvas = np.zeros([width, width, 3], dtype=np.uint8)
         canvas[(width - height) // 2 : (width + height) // 2, :] = img
@@ -237,6 +262,8 @@ def make_transform(
 
     if transform is None:
         return functools.partial(scale, output_width, output_height)
+    if transform == 'none':
+        return lambda x:x
     if transform == 'center-crop':
         if (output_width is None) or (output_height is None):
             error ('must specify --width and --height when using ' + transform + 'transform')
@@ -249,23 +276,39 @@ def make_transform(
 
 #----------------------------------------------------------------------------
 
-def open_dataset(source, *, max_images: Optional[int]):
-    if os.path.isdir(source):
-        if source.rstrip('/').endswith('_lmdb'):
-            return open_lmdb(source, max_images=max_images)
+def open_datasets(sources, *, max_images: Optional[int]):
+    sources = sources.split(',')
+    nums_samples = []
+    image_iters = []
+    for source in sources:
+        if os.path.isdir(source):
+            if source.rstrip('/').endswith('_lmdb'):
+                num_samples, image_iter = open_lmdb(source, max_images=max_images)
+                image_iters.append(image_iter)
+                nums_samples.append(num_samples)
+            else:
+                num_samples, image_iter = open_image_folder(source, max_images=max_images)
+                image_iters.append(image_iter)
+                nums_samples.append(num_samples)
+        elif os.path.isfile(source):
+            if os.path.basename(source) == 'cifar-10-python.tar.gz':
+                num_samples, image_iter = open_cifar10(source, max_images=max_images)
+                image_iters.append(image_iter)
+                nums_samples.append(num_samples)
+            elif os.path.basename(source) == 'train-images-idx3-ubyte.gz':
+                num_samples, image_iter = open_mnist(source, max_images=max_images)
+                image_iters.append(image_iter)
+                nums_samples.append(num_samples)
+            elif file_ext(source) == 'zip':
+                num_samples, image_iter = open_image_zip(source, max_images=max_images)
+                image_iters.append(image_iter)
+                nums_samples.append(num_samples)
+            else:
+                assert False, 'unknown archive type'
         else:
-            return open_image_folder(source, max_images=max_images)
-    elif os.path.isfile(source):
-        if os.path.basename(source) == 'cifar-10-python.tar.gz':
-            return open_cifar10(source, max_images=max_images)
-        elif os.path.basename(source) == 'train-images-idx3-ubyte.gz':
-            return open_mnist(source, max_images=max_images)
-        elif file_ext(source) == 'zip':
-            return open_image_zip(source, max_images=max_images)
-        else:
-            assert False, 'unknown archive type'
-    else:
-        error(f'Missing input file or directory: {source}')
+            error(f'Missing input file or directory: {source}')
+
+    return sum(nums_samples), itertools.chain(*image_iters)
 
 #----------------------------------------------------------------------------
 
@@ -307,9 +350,11 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
 @click.option('--dest', help='Output directory or archive name for output dataset', required=True, metavar='PATH')
 @click.option('--max-images', help='Output only up to `max-images` images', type=int, default=None)
 @click.option('--resize-filter', help='Filter to use when resizing images for output resolution', type=click.Choice(['box', 'lanczos']), default='lanczos', show_default=True)
-@click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide']))
+@click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide', 'none']))
 @click.option('--width', help='Output width', type=int)
 @click.option('--height', help='Output height', type=int)
+@click.option('--use-jpg', help='Use JPG', is_flag=True)
+@click.option('--encrypt', help='Encrypt data', is_flag=True)
 def convert_dataset(
     ctx: click.Context,
     source: str,
@@ -318,7 +363,9 @@ def convert_dataset(
     transform: Optional[str],
     resize_filter: str,
     width: Optional[int],
-    height: Optional[int]
+    height: Optional[int],
+    use_jpg: bool,
+    encrypt: bool
 ):
     """Convert an image dataset into a dataset archive usable with StyleGAN2 ADA PyTorch.
 
@@ -359,22 +406,27 @@ def convert_dataset(
         --transform=center-crop-wide --width 512 --height=384
     """
 
-    PIL.Image.init() # type: ignore
+    # PIL.Image.init() # type: ignore
 
     if dest == '':
         ctx.fail('--dest output filename or directory must not be an empty string')
 
-    num_files, input_iter = open_dataset(source, max_images=max_images)
+    num_files, input_iter = open_datasets(source, max_images=max_images)
     archive_root_dir, save_bytes, close_dest = open_dest(dest)
 
     transform_image = make_transform(transform, width, height, resize_filter)
 
     dataset_attrs = None
+    key = None
+    if encrypt:
+        key = Fernet.generate_key()
+        print("Key:", key.decode())
 
     labels = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
         idx_str = f'{idx:08d}'
-        archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
+        ext = '.jpg' if use_jpg else '.png'
+        archive_fname = f'{idx_str[:5]}/img{idx_str}{ext}'
 
         # Apply crop and resize.
         img = transform_image(image['img'])
@@ -406,10 +458,16 @@ def convert_dataset(
             error(f'Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n' + '\n'.join(err))
 
         # Save the image as an uncompressed PNG.
-        img = PIL.Image.fromarray(img, { 1: 'L', 3: 'RGB' }[channels])
-        image_bits = io.BytesIO()
-        img.save(image_bits, format='png', compress_level=0, optimize=False)
-        save_bytes(os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
+        # img = PIL.Image.fromarray(img, { 1: 'L', 3: 'RGB' }[channels])
+        # image_bits = io.BytesIO()
+
+        # image_bytes = io.BytesIO(cv2.imencode(ext, img)[1].tostring())
+        # image_bytes = image_bytes.getbuffer()
+        image_bytes = cv2.imencode(ext, img)[1].tostring()
+        if encrypt:
+            image_bytes = Fernet(key).encrypt(image_bytes)
+        # img.save(image_bits, format='png', compress_level=0, optimize=False)
+        save_bytes(os.path.join(archive_root_dir, archive_fname), image_bytes)
         labels.append([archive_fname, image['label']] if image['label'] is not None else None)
 
     metadata = {

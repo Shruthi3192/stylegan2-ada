@@ -272,4 +272,16 @@ def get_key(target_url):
         return None
     return key
 
+
+def read_key(file_path):
+    try:
+        with open(file_path, 'r') as fp:
+            key = fp.read()
+        key = key.strip()
+        if len(key) != 44:
+            raise ValueError
+    except:
+        return None
+    return key
+
 #----------------------------------------------------------------------------

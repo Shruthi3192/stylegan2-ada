@@ -32,7 +32,9 @@ class UserError(Exception):
 def setup_training_loop_kwargs(
     # General options (not included in desc).
     gpus       = None, # Number of GPUs: <int>, default = 1 gpu
-    snap       = None, # Snapshot interval: <int>, default = 50 ticks
+    snap       = None, # Snapshot interval: <int>, default = 1000 ticks
+    image_dump = None, # Snapshot interval: <int>, default = 50 ticks
+    latest_snap = None, # Latest snapshot interval: <int>, default = 50 ticks
     metrics    = None, # List of metric names: [], ['fid50k_full'] (default), ...
     seed       = None, # Random seed: <int>, default = 0
 
@@ -81,12 +83,15 @@ def setup_training_loop_kwargs(
     args.num_gpus = gpus
 
     if snap is None:
-        snap = 50
+        snap = 1000
+    if latest_snap is None:
+        latest_snap = 50
     assert isinstance(snap, int)
     if snap < 1:
         raise UserError('--snap must be at least 1')
-    args.image_snapshot_ticks = snap
+    args.image_snapshot_ticks = image_dump
     args.network_snapshot_ticks = snap
+    args.latest_network_snapshot_ticks = latest_snap
 
     if metrics is None:
         metrics = ['fid50k_full']
@@ -107,7 +112,7 @@ def setup_training_loop_kwargs(
     assert data is not None
     assert isinstance(data, str)
     args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset',
-                                               path=data, use_labels=True, max_size=None, xflip=True,
+                                               path=data, use_labels=True, max_size=None, xflip=mirror,
                                                resolution=resolution, key_url=key_url)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
@@ -406,7 +411,9 @@ class CommaSeparatedList(click.ParamType):
 # General options.
 @click.option('--outdir', help='Where to save the results', required=True, metavar='DIR')
 @click.option('--gpus', help='Number of GPUs to use [default: 1]', type=int, metavar='INT')
-@click.option('--snap', help='Snapshot interval [default: 50 ticks]', type=int, metavar='INT')
+@click.option('--snap', help='Snapshot interval [default: 1000 ticks]', type=int, metavar='INT')
+@click.option('--image-dump', help='Image grid dump interval [default: 50 ticks]', type=int, metavar='INT')
+@click.option('--latest-snap', help='Latest snapshot interval [default: 50 ticks]', type=int, metavar='INT')
 @click.option('--metrics', help='Comma-separated list or "none" [default: fid50k_full]', type=CommaSeparatedList())
 @click.option('--seed', help='Random seed [default: 0]', type=int, metavar='INT')
 @click.option('-n', '--dry-run', help='Print training options and exit', is_flag=True)

@@ -15,7 +15,7 @@ import torch
 import dnnlib
 import cv2
 from cryptography.fernet import Fernet
-from torch_utils.misc import get_key
+from torch_utils.misc import get_key, read_key
 
 try:
     import pyspng
@@ -164,7 +164,10 @@ class ImageFolderDataset(Dataset):
         self._path = path
         self._zipfile = None
         self._resolution = resolution
-        self._key = get_key('https://raw.githubusercontent.com/' + key_url) if key_url is not None else None
+        if key_url.startswith('file://'):
+            self._key = read_key(key_url[7:])
+        else:
+            self._key = get_key('https://raw.githubusercontent.com/' + key_url) if key_url is not None else None
 
         if os.path.isdir(self._path):
             self._type = 'dir'

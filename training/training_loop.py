@@ -111,8 +111,9 @@ def training_loop(
     ada_kimg                = 500,      # ADA adjustment speed, measured in how many kimg it takes for p to increase/decrease by one unit.
     total_kimg              = 25000,    # Total length of the training, measured in thousands of real images.
     kimg_per_tick           = 4,        # Progress snapshot interval.
-    image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
-    network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
+    image_snapshot_ticks    = 5,        # How often to save image snapshots? None = disable.
+    network_snapshot_ticks  = 1000,     # How often to save network snapshots? None = disable.
+    latest_network_snapshot_ticks = 50, # How often to save network snapshots? None = disable.
     resume_pkl              = None,     # Network pickle to resume training from.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
@@ -349,7 +350,9 @@ def training_loop(
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
-        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0) and cur_tick > 0:
+        cond_latest_snap = (latest_network_snapshot_ticks is not None) and cur_tick % latest_network_snapshot_ticks == 0 and cur_tick > 0
+        cond_snap = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0) and cur_tick > 0
+        if cond_latest_snap or cond_snap:
             snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))
             for name, module in [('G', G), ('D', D), ('G_ema', G_ema), ('augment_pipe', augment_pipe)]:
                 if module is not None:
@@ -358,7 +361,10 @@ def training_loop(
                     module = copy.deepcopy(module).eval().requires_grad_(False).cpu()
                 snapshot_data[name] = module
                 del module # conserve memory
-            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
+            if cond_latest_snap:
+                snapshot_pkl = os.path.join(run_dir, f'network-snapshot-latest.pkl')
+            else:
+                snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)

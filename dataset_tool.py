@@ -16,7 +16,7 @@ import tarfile
 import gzip
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, List
 
 import click
 import numpy as np
@@ -36,7 +36,7 @@ def error(msg):
 #----------------------------------------------------------------------------
 
 def maybe_min(a: int, b: Optional[int]) -> int:
-    if b is not None:
+    if b is not None and b > 0:
         return min(a, b)
     return a
 
@@ -49,7 +49,7 @@ def file_ext(name: Union[str, Path]) -> str:
 
 def is_image_ext(fname: Union[str, Path]) -> bool:
     ext = file_ext(fname).lower()
-    return f'.{ext}' in PIL.Image.EXTENSION # type: ignore
+    return f'.{ext}' in ('.jpg', '.jpeg', '.png', '.bmp', '.heic') # type: ignore
 
 #----------------------------------------------------------------------------
 
@@ -58,11 +58,10 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
     if os.path.isfile(os.path.join(source_dir, 'images_list.txt')):
         with open(os.path.join(source_dir, 'images_list.txt')) as fp:
             input_images = fp.read().splitlines()
-        random.shuffle(input_images)
         input_images = [os.path.join(source_dir, name) for name in input_images]
     else:
         input_images = [str(f) for f in sorted(Path(source_dir).rglob('*')) if is_image_ext(f) and os.path.isfile(f)]
-
+    random.shuffle(input_images)
     # Load labels.
     labels = {}
     meta_fname = os.path.join(source_dir, 'dataset.json')
@@ -276,11 +275,10 @@ def make_transform(
 
 #----------------------------------------------------------------------------
 
-def open_datasets(sources, *, max_images: Optional[int]):
-    sources = sources.split(',')
+def open_datasets(sources, *, max_images_list: Optional[List[int]]):
     nums_samples = []
     image_iters = []
-    for source in sources:
+    for max_images, source in zip(max_images_list, sources):
         if os.path.isdir(source):
             if source.rstrip('/').endswith('_lmdb'):
                 num_samples, image_iter = open_lmdb(source, max_images=max_images)
@@ -348,7 +346,7 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
 @click.pass_context
 @click.option('--source', help='Directory or archive name for input dataset', required=True, metavar='PATH')
 @click.option('--dest', help='Output directory or archive name for output dataset', required=True, metavar='PATH')
-@click.option('--max-images', help='Output only up to `max-images` images', type=int, default=None)
+@click.option('--max-images', help='Output only up to `max-images` images', type=str, default=None)
 @click.option('--resize-filter', help='Filter to use when resizing images for output resolution', type=click.Choice(['box', 'lanczos']), default='lanczos', show_default=True)
 @click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide', 'none']))
 @click.option('--width', help='Output width', type=int)
@@ -359,7 +357,7 @@ def convert_dataset(
     ctx: click.Context,
     source: str,
     dest: str,
-    max_images: Optional[int],
+    max_images: Optional[str],
     transform: Optional[str],
     resize_filter: str,
     width: Optional[int],
@@ -411,7 +409,16 @@ def convert_dataset(
     if dest == '':
         ctx.fail('--dest output filename or directory must not be an empty string')
 
-    num_files, input_iter = open_datasets(source, max_images=max_images)
+    sources = source.split(',')
+    if isinstance(max_images, str):
+        parts = max_images.split(',')
+        if len(parts) == 1 and len(sources) > 1:
+            parts = parts * len(sources)
+        max_images = [int(v) for v in parts]
+    else:
+        max_images = [max_images] * len(sources)
+    assert len(max_images) == len(sources)
+    num_files, input_iter = open_datasets(sources, max_images_list=max_images)
     archive_root_dir, save_bytes, close_dest = open_dest(dest)
 
     transform_image = make_transform(transform, width, height, resize_filter)
@@ -421,6 +428,12 @@ def convert_dataset(
     if encrypt:
         key = Fernet.generate_key()
         print("Key:", key.decode())
+
+        if not os.path.isdir(dest):
+            dest = os.path.dirname(dest)
+
+        with open(os.path.join(dest, 'key.txt'), 'w') as fp:
+            fp.write(key.decode())
 
     labels = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
@@ -437,25 +450,26 @@ def convert_dataset(
 
         # Error check to require uniform image attributes across
         # the whole dataset.
-        channels = img.shape[2] if img.ndim == 3 else 1
-        cur_image_attrs = {
-            'width': img.shape[1],
-            'height': img.shape[0],
-            'channels': channels
-        }
-        if dataset_attrs is None:
-            dataset_attrs = cur_image_attrs
-            width = dataset_attrs['width']
-            height = dataset_attrs['height']
-            if width != height:
-                error(f'Image dimensions after scale and crop are required to be square.  Got {width}x{height}')
-            if dataset_attrs['channels'] not in [1, 3]:
-                error('Input images must be stored as RGB or grayscale')
-            if width != 2 ** int(np.floor(np.log2(width))):
-                error('Image width/height after scale and crop are required to be power-of-two')
-        elif dataset_attrs != cur_image_attrs:
-            err = [f'  dataset {k}/cur image {k}: {dataset_attrs[k]}/{cur_image_attrs[k]}' for k in dataset_attrs.keys()]
-            error(f'Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n' + '\n'.join(err))
+
+        # channels = img.shape[2] if img.ndim == 3 else 1
+        # cur_image_attrs = {
+        #     'width': img.shape[1],
+        #     'height': img.shape[0],
+        #     'channels': channels
+        # }
+        # if dataset_attrs is None:
+        #     dataset_attrs = cur_image_attrs
+        #     width = dataset_attrs['width']
+        #     height = dataset_attrs['height']
+        #     if width != height:
+        #         error(f'Image dimensions after scale and crop are required to be square.  Got {width}x{height}')
+        #     if dataset_attrs['channels'] not in [1, 3]:
+        #         error('Input images must be stored as RGB or grayscale')
+        #     if width != 2 ** int(np.floor(np.log2(width))):
+        #         error('Image width/height after scale and crop are required to be power-of-two')
+        # elif dataset_attrs != cur_image_attrs:
+        #     err = [f'  dataset {k}/cur image {k}: {dataset_attrs[k]}/{cur_image_attrs[k]}' for k in dataset_attrs.keys()]
+        #     error(f'Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n' + '\n'.join(err))
 
         # Save the image as an uncompressed PNG.
         # img = PIL.Image.fromarray(img, { 1: 'L', 3: 'RGB' }[channels])

@@ -16,6 +16,7 @@ import dnnlib
 import cv2
 from cryptography.fernet import Fernet
 from torch_utils.misc import get_key, read_key
+import pickle
 
 try:
     import pyspng
@@ -250,6 +251,22 @@ class ImageFolderDataset(Dataset):
         labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
         labels = np.array(labels)
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        return labels
+
+
+class ImageFolderDatasetDescr(ImageFolderDataset):
+    def __init__(self, **super_kwargs):
+        super().__init__(**super_kwargs)
+
+    def _load_raw_labels(self):
+        fname = 'descriptors.pkl'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            labels = pickle.load(f)
+        if labels is None:
+            return None
+        labels = np.array(labels)
         return labels
 
 #----------------------------------------------------------------------------

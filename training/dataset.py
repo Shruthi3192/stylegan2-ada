@@ -159,18 +159,13 @@ class ImageFolderDataset(Dataset):
     def __init__(self,
         path,                   # Path to directory or zip.
         resolution=None,        # Image resolution
-        key_url=None,
+        key=None,
         **super_kwargs,         # Additional arguments for the Dataset base class.
     ):
         self._path = path
         self._zipfile = None
         self._resolution = resolution
-        self._key = None
-        if key_url is not None:
-            if key_url.startswith('file://'):
-                self._key = read_key(key_url[7:])
-            else:
-                self._key = get_key('https://raw.githubusercontent.com/' + key_url)
+        self._key = key
 
         if os.path.isdir(self._path):
             self._type = 'dir'

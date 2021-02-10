@@ -16,11 +16,13 @@ import json
 import tempfile
 import torch
 import dnnlib
+from copy import deepcopy
 
 from training import training_loop
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
+from torch_utils.misc import get_key, read_key
 
 #----------------------------------------------------------------------------
 
@@ -111,9 +113,15 @@ def setup_training_loop_kwargs(
 
     assert data is not None
     assert isinstance(data, str)
+    key = None
+    if key_url is not None:
+        if key_url.startswith('file://'):
+            key = read_key(key_url[7:])
+        else:
+            key = get_key('https://raw.githubusercontent.com/' + key_url)
     args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset',
                                                path=data, use_labels=True, max_size=None, xflip=mirror,
-                                               resolution=resolution, key_url=key_url)
+                                               resolution=resolution, key=key)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
@@ -514,7 +522,9 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     # Print options.
     print()
     print('Training options:')
-    print(json.dumps(args, indent=2))
+    args_vis = deepcopy(args)
+    args_vis.training_set_kwargs.pop('key', None)
+    print(json.dumps(args_vis, indent=2))
     print()
     print(f'Output directory:   {args.run_dir}')
     print(f'Training data:      {args.training_set_kwargs.path}')

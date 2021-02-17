@@ -17,6 +17,7 @@ import dnnlib
 import numpy as np
 import PIL.Image
 import torch
+import pickle
 
 import legacy
 
@@ -39,7 +40,8 @@ def num_range(s: str) -> List[int]:
 @click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
 @click.option('--seeds', type=num_range, help='List of random seeds')
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
-@click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
+# @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
+@click.option('--class', 'class_file', type=str, metavar='FILE')
 @click.option('--noise-mode', help='Noise mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True)
 @click.option('--projected-w', help='Projection result file', type=str, metavar='FILE')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
@@ -50,7 +52,7 @@ def generate_images(
     truncation_psi: float,
     noise_mode: str,
     outdir: str,
-    class_idx: Optional[int],
+    class_file: str,
     projected_w: Optional[str]
 ):
     """Generate images using pretrained network pickle.
@@ -105,11 +107,13 @@ def generate_images(
     # Labels.
     label = torch.zeros([1, G.c_dim], device=device)
     if G.c_dim != 0:
-        if class_idx is None:
+        if class_file is None:
             ctx.fail('Must specify class label with --class when using a conditional network')
-        label[:, class_idx] = 1
+        with open(class_file, 'rb') as fp:
+            class_v = pickle.load(fp)
+        label[0, :] = torch.from_numpy(class_v)
     else:
-        if class_idx is not None:
+        if class_file is not None:
             print ('warn: --class=lbl ignored when running on an unconditional network')
 
     # Generate images.

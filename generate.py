@@ -39,6 +39,7 @@ def num_range(s: str) -> List[int]:
 @click.pass_context
 @click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
 @click.option('--seeds', type=num_range, help='List of random seeds')
+@click.option('--gpu', type=int, default=0, help='GPU device')
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
 # @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
 @click.option('--class', 'class_file', type=str, metavar='FILE')
@@ -49,6 +50,7 @@ def generate_images(
     ctx: click.Context,
     network_pkl: str,
     seeds: Optional[List[int]],
+    gpu: Optional[int],
     truncation_psi: float,
     noise_mode: str,
     outdir: str,
@@ -81,7 +83,8 @@ def generate_images(
     """
 
     print('Loading networks from "%s"...' % network_pkl)
-    device = torch.device('cuda')
+    gpu_id = gpu
+    device = torch.device(f'cuda:{gpu_id}')
     with dnnlib.util.open_url(network_pkl) as f:
         G = legacy.load_network_pkl(f)['G_ema'].to(device) # type: ignore
 

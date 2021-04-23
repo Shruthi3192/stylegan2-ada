@@ -1206,6 +1206,7 @@ class GradualStyleBlock(torch.nn.Module):
                 Conv2dLayer(ch0, ch1, kernel_size=3, down=2, bias=False)
             ]
         self.convs = torch.nn.Sequential(*modules)
+        self.last_conv_ch = ch1
         lr_multiplier = 0.01
         linear = [BiasAct(ch1, bias=True),
                   FullyConnectedLayer(ch1, out_c, activation='linear', lr_multiplier=lr_multiplier)]
@@ -1213,7 +1214,7 @@ class GradualStyleBlock(torch.nn.Module):
 
     def forward(self, x):
         x = self.convs(x)
-        x = x.view(-1, self.out_c)
+        x = x.view(-1, self.last_conv_ch)
         x = self.linear(x)
         return x
 

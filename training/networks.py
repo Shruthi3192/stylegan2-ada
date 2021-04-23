@@ -171,6 +171,35 @@ class Conv2dLayer(torch.nn.Module):
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
+class BiasAct(torch.nn.Module):
+    def __init__(self,
+        in_channels,                    # Number of input channels.
+        bias            = True,         # Apply additive bias before the activation function?
+        activation      = 'lrelu',      # Activation function: 'relu', 'lrelu', etc.
+        trainable       = True,         # Update the weights of this layer during training?
+    ):
+        super().__init__()
+        self.activation = activation
+        self.act_gain = bias_act.activation_funcs[activation].def_gain
+
+        bias = torch.zeros([in_channels]) if bias else None
+        if trainable:
+            self.bias = torch.nn.Parameter(bias) if bias is not None else None
+        else:
+            if bias is not None:
+                self.register_buffer('bias', bias)
+            else:
+                self.bias = None
+
+    def forward(self, x, gain=1):
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        act_gain = self.act_gain * gain
+        x = bias_act.bias_act(x, b, act=self.activation, gain=act_gain, clamp=None)
+        return x
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
 class MappingNetwork(torch.nn.Module):
     def __init__(self,
         z_dim,                      # Input latent (Z) dimensionality, 0 = no latent.
@@ -481,6 +510,7 @@ class Generator(torch.nn.Module):
         w_dim,                      # Intermediate latent (W) dimensionality.
         img_resolution,             # Output resolution.
         img_channels,               # Number of output color channels.
+        map_channels,               # Number of conditional map channels.
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         synthesis_kwargs    = {},   # Arguments for SynthesisNetwork.
     ):
@@ -490,12 +520,15 @@ class Generator(torch.nn.Module):
         self.w_dim = w_dim
         self.img_resolution = img_resolution
         self.img_channels = img_channels
+        self.map_channels = map_channels
         self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.encoder = Encoder(w_dim=w_dim, img_resolution=img_resolution, img_channels=map_channels)
 
-    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+    def forward(self, z, img, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+        ws = self.encoder(ws, img)
         img = self.synthesis(ws, **synthesis_kwargs)
         return img
 
@@ -509,6 +542,7 @@ class DiscriminatorBlock(torch.nn.Module):
         out_channels,                       # Number of output channels.
         resolution,                         # Resolution of this block.
         img_channels,                       # Number of input color channels.
+        map_channels,                       # Number of conditional map channels.
         first_layer_idx,                    # Index of the first layer.
         architecture        = 'resnet',     # Architecture: 'orig', 'skip', 'resnet'.
         activation          = 'lrelu',      # Activation function: 'relu', 'lrelu', etc.
@@ -524,6 +558,7 @@ class DiscriminatorBlock(torch.nn.Module):
         self.in_channels = in_channels
         self.resolution = resolution
         self.img_channels = img_channels
+        self.map_channels = map_channels
         self.first_layer_idx = first_layer_idx
         self.architecture = architecture
         self.use_fp16 = use_fp16
@@ -540,7 +575,7 @@ class DiscriminatorBlock(torch.nn.Module):
         trainable_iter = trainable_gen()
 
         if in_channels == 0 or architecture == 'skip':
-            self.fromrgb = Conv2dLayer(img_channels, tmp_channels, kernel_size=1, activation=activation,
+            self.fromrgb = Conv2dLayer(img_channels + map_channels, tmp_channels, kernel_size=1, activation=activation,
                 trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
 
         self.conv0 = Conv2dLayer(tmp_channels, tmp_channels, kernel_size=3, activation=activation,
@@ -564,7 +599,7 @@ class DiscriminatorBlock(torch.nn.Module):
 
         # FromRGB.
         if self.in_channels == 0 or self.architecture == 'skip':
-            misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
+            misc.assert_shape(img, [None, self.img_channels+self.map_channels, self.resolution, self.resolution])
             img = img.to(dtype=dtype, memory_format=memory_format)
             y = self.fromrgb(img)
             x = x + y if x is not None else y
@@ -615,6 +650,7 @@ class MinibatchStdLayer(torch.nn.Module):
 class DiscriminatorEpilogue(torch.nn.Module):
     def __init__(self,
         in_channels,                    # Number of input channels.
+        map_channels,                   # Number of map channels.
         cmap_dim,                       # Dimensionality of mapped conditioning label, 0 = no label.
         resolution,                     # Resolution of this block.
         img_channels,                   # Number of input color channels.
@@ -675,6 +711,7 @@ class Discriminator(torch.nn.Module):
         c_dim,                          # Conditioning label (C) dimensionality.
         img_resolution,                 # Input resolution.
         img_channels,                   # Number of input color channels.
+        map_channels        = 0,        # Number of conditional map channels.
         architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,    # Overall multiplier for the number of channels.
         channel_max         = 512,      # Maximum number of channels in any layer.
@@ -690,6 +727,7 @@ class Discriminator(torch.nn.Module):
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
         self.img_channels = img_channels
+        self.map_channels = map_channels
         self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
@@ -699,7 +737,8 @@ class Discriminator(torch.nn.Module):
         if c_dim == 0:
             cmap_dim = 0
 
-        common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
+        common_kwargs = dict(img_channels=img_channels, map_channels=map_channels,
+                             architecture=architecture, conv_clamp=conv_clamp)
         cur_layer_idx = 0
         for res in self.block_resolutions:
             in_channels = channels_dict[res] if res < img_resolution else 0
@@ -727,3 +766,540 @@ class Discriminator(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
+
+
+def conv3x3(in_planes, out_planes, down=1, bias=False):
+    """3x3 convolution with zero padding"""
+    conv = Conv2dLayer(in_planes, out_planes, kernel_size=3, down=down, bias=bias)
+    return conv
+
+
+def conv1x1(in_planes, out_planes, down=1, bias=False):
+    """1x1 convolution"""
+    conv = Conv2dLayer(in_planes, out_planes, kernel_size=1, down=down, bias=bias)
+    return conv
+
+
+class BasicBlock(torch.nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.relu1 = BiasAct(inplanes, bias=True)
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.relu2 = BiasAct(planes, bias=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.relu1(x)
+        out = self.conv1(out)
+
+        out = self.relu2(out)
+        out = self.conv2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out = (out + residual) / np.sqrt(2.0)
+
+        return out
+
+
+class Bottleneck(torch.nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.relu1 = BiasAct(inplanes, bias=True)
+        self.conv1 = conv1x1(inplanes, planes)
+        self.relu2 = BiasAct(planes, bias=True)
+        self.conv2 = conv3x3(planes, planes, stride)
+        self.relu3 = BiasAct(planes, bias=True)
+        self.conv3 = conv1x1(planes, planes * self.expansion)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.relu1(x)
+        out = self.conv1(out)
+
+        out = self.relu2(out)
+        out = self.conv2(out)
+
+        out = self.relu3(out)
+        out = self.conv3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out = (out + residual) / np.sqrt(2.0)
+
+        return out
+
+
+class HighResolutionModule(torch.nn.Module):
+    def __init__(self, num_branches, blocks, num_blocks, num_inchannels,
+                 num_channels, multi_scale_output=True):
+        super(HighResolutionModule, self).__init__()
+        self._check_branches(
+            num_branches, blocks, num_blocks, num_inchannels, num_channels)
+
+        self.num_inchannels = num_inchannels
+        self.num_branches = num_branches
+
+        self.multi_scale_output = multi_scale_output
+
+        self.branches = self._make_branches(
+            num_branches, blocks, num_blocks, num_channels)
+        self.fuse_layers = self._make_fuse_layers()
+
+    def _check_branches(self, num_branches, blocks, num_blocks,
+                        num_inchannels, num_channels):
+        if num_branches != len(num_blocks):
+            error_msg = 'NUM_BRANCHES({}) <> NUM_BLOCKS({})'.format(
+                num_branches, len(num_blocks))
+            print(error_msg)
+            raise ValueError(error_msg)
+
+        if num_branches != len(num_channels):
+            error_msg = 'NUM_BRANCHES({}) <> NUM_CHANNELS({})'.format(
+                num_branches, len(num_channels))
+            print(error_msg)
+            raise ValueError(error_msg)
+
+        if num_branches != len(num_inchannels):
+            error_msg = 'NUM_BRANCHES({}) <> NUM_INCHANNELS({})'.format(
+                num_branches, len(num_inchannels))
+            print(error_msg)
+            raise ValueError(error_msg)
+
+    def _make_one_branch(self, branch_index, block, num_blocks, num_channels,
+                         stride=1):
+        downsample = None
+        if stride != 1 or \
+                self.num_inchannels[branch_index] != num_channels[branch_index] * block.expansion:
+            downsample = conv1x1(self.num_inchannels[branch_index],
+                                 num_channels[branch_index] * block.expansion,
+                                 down=stride, bias=False)
+
+        layers = []
+        layers.append(block(self.num_inchannels[branch_index],
+                            num_channels[branch_index], stride, downsample))
+        self.num_inchannels[branch_index] = \
+            num_channels[branch_index] * block.expansion
+        for i in range(1, num_blocks[branch_index]):
+            layers.append(block(self.num_inchannels[branch_index],
+                                num_channels[branch_index]))
+
+        return torch.nn.Sequential(*layers)
+
+    def _make_branches(self, num_branches, block, num_blocks, num_channels):
+        branches = []
+
+        for i in range(num_branches):
+            branches.append(
+                self._make_one_branch(i, block, num_blocks, num_channels))
+
+        return torch.nn.ModuleList(branches)
+
+    def _make_fuse_layers(self):
+        if self.num_branches == 1:
+            return None
+
+        num_branches = self.num_branches
+        num_inchannels = self.num_inchannels
+        fuse_layers = []
+        for i in range(num_branches if self.multi_scale_output else 1):
+            fuse_layer = []
+            for j in range(num_branches):
+                if j > i:
+                    fuse_layer.append(torch.nn.Sequential(
+                        BiasAct(num_inchannels[j]),
+                        conv1x1(num_inchannels[j], num_inchannels[i],
+                                down=1, bias=False)))
+                elif j == i:
+                    fuse_layer.append(None)
+                else:
+                    conv3x3s = []
+                    for k in range(i - j):
+                        if k == i - j - 1:
+                            num_outchannels_conv3x3 = num_inchannels[i]
+                            conv3x3s.append(torch.nn.Sequential(
+                                BiasAct(num_inchannels[j]),
+                                conv3x3(num_inchannels[j], num_outchannels_conv3x3,
+                                        down=2, bias=False)))
+                        else:
+                            num_outchannels_conv3x3 = num_inchannels[j]
+                            conv3x3s.append(torch.nn.Sequential(
+                                BiasAct(num_inchannels[j]),
+                                conv3x3(num_inchannels[j], num_outchannels_conv3x3,
+                                        down=2, bias=False)))
+
+                    fuse_layer.append(torch.nn.Sequential(*conv3x3s))
+            fuse_layers.append(torch.nn.ModuleList(fuse_layer))
+
+        return torch.nn.ModuleList(fuse_layers)
+
+    def get_num_inchannels(self):
+        return self.num_inchannels
+
+    def forward(self, x):
+        if self.num_branches == 1:
+            return [self.branches[0](x[0])]
+
+        for i in range(self.num_branches):
+            x[i] = self.branches[i](x[i])
+
+        x_fuse = []
+        for i in range(len(self.fuse_layers)):
+            y = x[0] if i == 0 else self.fuse_layers[i][0](x[0])
+            for j in range(1, self.num_branches):
+                if i == j:
+                    y = (y + x[j]) / np.sqrt(2.0)
+                elif j > i:
+                    width_output = x[i].shape[-1]
+                    height_output = x[i].shape[-2]
+                    y = (y + torch.nn.functional.interpolate(
+                        self.fuse_layers[i][j](x[j]),
+                        size=[height_output, width_output],
+                        mode='bilinear', align_corners=True)) / np.sqrt(2.0)
+                else:
+                    y = (y + self.fuse_layers[i][j](x[j])) / np.sqrt(2.0)
+            x_fuse.append(y)
+
+        return x_fuse
+
+
+blocks_dict = {
+    'BASIC': BasicBlock,
+    'BOTTLENECK': Bottleneck
+}
+
+
+class EncoderMainBlock(torch.nn.Module):
+    def __init__(self, in_channels, channels, from_rgb=False):
+        super().__init__()
+
+        self.from_rgb = from_rgb
+        if not from_rgb:
+            self.relu1 = BiasAct(in_channels, bias=True)
+
+        self.conv1 = Conv2dLayer(in_channels, channels, kernel_size=3, bias=False, down=2)
+
+    def forward(self, x):
+
+        y = x
+
+        if not self.from_rgb:
+            y = self.relu1(y)
+
+        y = self.conv1(y)
+
+        return y
+
+
+class DecoderMainBlock(torch.nn.Module):
+    def __init__(self, in_channels, channels):
+        super().__init__()
+
+        self.relu1 = BiasAct(in_channels, bias=True)
+        self.conv1 = Conv2dLayer(in_channels, channels, kernel_size=3, bias=False, up=2)
+
+    def forward(self, x):
+
+        y = x
+
+        y = self.relu1(y)
+        y = self.conv1(y)
+
+        return y
+
+
+class HighResolutionNet(torch.nn.Module):
+
+    def __init__(self, img_channels, stage_modules, stage_num_branches,
+                 stage_num_blocks, stage_num_channels,
+                 stage_block_types):
+        super(HighResolutionNet, self).__init__()
+
+        # hrnet params
+        self.stage_modules = stage_modules
+        self.stage_num_branches = stage_num_branches
+        self.stage_num_blocks = stage_num_blocks
+        self.stage_num_channels = stage_num_channels
+        self.stage_block_types = stage_block_types
+
+        # stem net
+        stem_num_channels = self.stage_num_channels[0][0]
+        self.encoder1 = EncoderMainBlock(in_channels=img_channels, channels=stem_num_channels//2, from_rgb=True)
+        self.encoder2 = EncoderMainBlock(in_channels=stem_num_channels//2,
+                                         channels=stem_num_channels)
+
+        num_channels = self.stage_num_channels[0][0]
+        block = blocks_dict[self.stage_block_types[0]]
+        num_blocks = self.stage_num_blocks[0][0]
+
+        self.layer1 = self._make_layer(block, stem_num_channels, num_channels, num_blocks)
+        stage1_out_channel = block.expansion * num_channels
+
+        num_channels = self.stage_num_channels[1]
+        block = blocks_dict[self.stage_block_types[1]]
+        num_channels = [
+            num_channels[i] * block.expansion for i in range(len(num_channels))]
+        self.transition1 = self._make_transition_layer(
+            [stage1_out_channel], num_channels)
+        self.stage2, pre_stage_channels = self._make_stage(
+            self.stage_modules[1], self.stage_num_branches[1],
+            self.stage_num_blocks[1], self.stage_num_channels[1],
+            num_channels, self.stage_block_types[1])
+
+        num_channels = self.stage_num_channels[2]
+        block = blocks_dict[self.stage_block_types[2]]
+        num_channels = [
+            num_channels[i] * block.expansion for i in range(len(num_channels))]
+        self.transition2 = self._make_transition_layer(
+            pre_stage_channels, num_channels)
+        self.stage3, pre_stage_channels = self._make_stage(
+            self.stage_modules[2], self.stage_num_branches[2],
+            self.stage_num_blocks[2], self.stage_num_channels[2],
+            num_channels, self.stage_block_types[2])
+
+        num_channels = self.stage_num_channels[3]
+        block = blocks_dict[self.stage_block_types[3]]
+        num_channels = [
+            num_channels[i] * block.expansion for i in range(len(num_channels))]
+        self.transition3 = self._make_transition_layer(
+            pre_stage_channels, num_channels)
+        self.stage4, pre_stage_channels = self._make_stage(
+            self.stage_modules[3], self.stage_num_branches[3],
+            self.stage_num_blocks[3], self.stage_num_channels[3],
+            num_channels, self.stage_block_types[3], multi_scale_output=True)
+
+    def _make_transition_layer(
+            self, num_channels_pre_layer, num_channels_cur_layer):
+        num_branches_cur = len(num_channels_cur_layer)
+        num_branches_pre = len(num_channels_pre_layer)
+
+        transition_layers = []
+        for i in range(num_branches_cur):
+            if i < num_branches_pre:
+                if num_channels_cur_layer[i] != num_channels_pre_layer[i]:
+                    transition_layers.append(torch.nn.Sequential(
+                        BiasAct(num_channels_pre_layer[i]),
+                        conv3x3(num_channels_pre_layer[i], num_channels_cur_layer[i], bias=False)))
+                else:
+                    transition_layers.append(None)
+            else:
+                conv3x3s = []
+                for j in range(i + 1 - num_branches_pre):
+                    inchannels = num_channels_pre_layer[-1]
+                    outchannels = num_channels_cur_layer[i] \
+                        if j == i - num_branches_pre else inchannels
+                    conv3x3s.append(torch.nn.Sequential(
+                        BiasAct(inchannels),
+                        conv3x3(inchannels, outchannels,
+                                down=2, bias=False)))
+                transition_layers.append(torch.nn.Sequential(*conv3x3s))
+
+        return torch.nn.ModuleList(transition_layers)
+
+    def _make_layer(self, block, inplanes, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or inplanes != planes * block.expansion:
+            downsample = conv1x1(inplanes, planes * block.expansion,
+                                 down=stride, bias=False)
+
+        layers = []
+        layers.append(block(inplanes, planes, stride, downsample))
+        inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(inplanes, planes))
+
+        return torch.nn.Sequential(*layers)
+
+    def _make_stage(self, num_modules, num_branches, num_blocks, num_channels, num_inchannels,
+                    block_type, multi_scale_output=True):
+        block = blocks_dict[block_type]
+
+        modules = []
+        for i in range(num_modules):
+            # multi_scale_output is only used last module
+            if not multi_scale_output and i == num_modules - 1:
+                reset_multi_scale_output = False
+            else:
+                reset_multi_scale_output = True
+            modules.append(
+                HighResolutionModule(num_branches,
+                                     block,
+                                     num_blocks,
+                                     num_inchannels,
+                                     num_channels,
+                                     reset_multi_scale_output)
+            )
+            num_inchannels = modules[-1].get_num_inchannels()
+
+        return torch.nn.Sequential(*modules), num_inchannels
+
+    def forward(self, x):
+
+        # x = torch.cat([x, mask], dim=1)
+
+        x = self.encoder1(x)
+        x = self.encoder2(x)
+
+        x = self.layer1(x)
+
+        x_list = []
+        for i in range(self.stage_num_branches[1]):
+            if self.transition1[i] is not None:
+                x_list.append(self.transition1[i](x))
+            else:
+                x_list.append(x)
+        y_list = self.stage2(x_list)
+
+        x_list = []
+        for i in range(self.stage_num_branches[2]):
+            if self.transition2[i] is not None:
+                if i < self.stage_num_branches[1]:
+                    x_list.append(self.transition2[i](y_list[i]))
+                else:
+                    x_list.append(self.transition2[i](y_list[-1]))
+            else:
+                x_list.append(y_list[i])
+        y_list = self.stage3(x_list)
+
+        x_list = []
+        for i in range(self.stage_num_branches[3]):
+            if self.transition3[i] is not None:
+                if i < self.stage_num_branches[2]:
+                    x_list.append(self.transition3[i](y_list[i]))
+                else:
+                    x_list.append(self.transition3[i](y_list[-1]))
+            else:
+                x_list.append(y_list[i])
+        x = self.stage4(x_list)
+        feats = x
+
+        return feats
+
+
+class GradualStyleBlock(torch.nn.Module):
+    def __init__(self, in_c, out_c, steps):
+        super(GradualStyleBlock, self).__init__()
+        self.out_c = out_c
+        modules = []
+        fmap_mult = 1.5
+        ch1 = min(int(fmap_mult * in_c), out_c)
+        modules += [BiasAct(in_c, bias=True),
+                    Conv2dLayer(in_c, ch1, kernel_size=3, down=2, bias=False)]
+        for i in range(steps - 1):
+            ch0 = ch1
+            ch1 = min(int(fmap_mult * ch0), out_c)
+            modules += [
+                BiasAct(ch0, bias=True),
+                Conv2dLayer(ch0, ch1, kernel_size=3, down=2, bias=False)
+            ]
+        self.convs = torch.nn.Sequential(*modules)
+        lr_multiplier = 0.01
+        linear = [BiasAct(ch1, bias=True),
+                  FullyConnectedLayer(ch1, out_c, activation='linear', lr_multiplier=lr_multiplier)]
+        self.linear = torch.nn.Sequential(*linear)
+
+    def forward(self, x):
+        x = self.convs(x)
+        x = x.view(-1, self.out_c)
+        x = self.linear(x)
+        return x
+
+
+class Encoder(torch.nn.Module):
+
+    def __init__(self, w_dim, img_resolution, img_channels):
+        super(Encoder, self).__init__()
+        self.img_resolution = img_resolution
+        self.img_resolution_log2 = int(np.log2(img_resolution))
+        self.backbone = self.get_hrnet_w18_small_v2(img_channels)
+
+        self.styles = torch.nn.ModuleList()
+        self.style_count = 2 * self.img_resolution_log2 - 2
+
+        assert self.img_resolution_log2 in [10, 9, 8]
+        if self.img_resolution_log2 == 10:
+            self.coarse_ind = 3
+            self.middle_ind = 7
+        elif self.img_resolution_log2 == 9:
+            self.coarse_ind = 3
+            self.middle_ind = 7
+        else:
+            self.coarse_ind = 3
+            self.middle_ind = 7
+
+        for i in range(self.style_count):
+            if i < self.coarse_ind:
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-1], w_dim, self.img_resolution_log2-5)
+            elif i < self.middle_ind:
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-2], w_dim, self.img_resolution_log2-4)
+            else:
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-3], w_dim, self.img_resolution_log2-3)
+            self.styles.append(style)
+
+    def get_hrnet_w18_small_v2(self, img_channels):
+
+        stage_modules = [1, 1, 3, 2]
+        stage_num_branches = [1, 2, 3, 4]
+        stage_num_blocks = [[2], [2, 2], [2, 2, 2], [2, 2, 2, 2]]
+        stage_num_channels = [[64], [18, 36], [18, 36, 72], [18, 36, 72, 144]]
+        stage_block_types = ['BOTTLENECK', 'BASIC', 'BASIC', 'BASIC']
+
+        model = HighResolutionNet(img_channels=img_channels, stage_modules=stage_modules,
+                                  stage_num_branches=stage_num_branches, stage_num_blocks=stage_num_blocks,
+                                  stage_num_channels=stage_num_channels, stage_block_types=stage_block_types)
+
+        return model
+
+    def forward(self, ws, x):
+        feats = self.backbone(x)
+        # feats - \4, \8, \16, \32
+
+        latents = []
+
+        _, c2, c3, c4 = feats
+
+        for j in range(self.coarse_ind):
+            latents.append(self.styles[j](c4))
+
+        for j in range(self.coarse_ind, self.middle_ind):
+            latents.append(self.styles[j](c3))
+
+        for j in range(self.middle_ind, self.style_count):
+            latents.append(self.styles[j](c2))
+
+        out = torch.stack(latents, dim=1)
+        return ws + out
+
+
+if __name__ == '__main__':
+    from matplotlib import pyplot as plt
+    device = torch.device('cuda:0')
+
+    z_dim = 512
+    w_dim = 512
+    resol = 256
+
+    G = Generator(z_dim=z_dim, c_dim=0, w_dim=w_dim, img_resolution=resol, img_channels=3).to(device)
+    input = torch.randn((1, 3, resol, resol), device=device)
+    z = torch.randn((1, z_dim), device=device)
+
+    with torch.no_grad():
+        output = G(z=z, img=input, c=None)
+
+    output = output.cpu().numpy()
+    img = np.transpose(output[0], (1, 2, 0))
+    plt.imshow(img)
+    plt.show()

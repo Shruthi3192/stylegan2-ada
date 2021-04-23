@@ -212,9 +212,11 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
 
     # Main loop.
     item_subset = [(i * opts.num_gpus + opts.rank) % num_items for i in range((num_items - 1) // opts.num_gpus + 1)]
-    for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
+    for _, _, images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
+        if images.shape[1] == 2:
+            images = torch.cat([images, torch.zeros(images.shape[0], 1, images.shape[2], images.shape[3])], dim=1)
         features = detector(images.to(opts.device), **detector_kwargs)
         stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
         progress.update(stats.num_items)

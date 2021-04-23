@@ -60,22 +60,55 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
     # Load data.
-    images, labels = zip(*[training_set[i] for i in grid_indices])
-    return (gw, gh), np.stack(images), np.stack(labels)
+    images, masks, contours_masks, labels = zip(*[training_set[i] for i in grid_indices])
+    return (gw, gh), np.stack(images), np.stack(masks), np.stack(contours_masks), np.stack(labels)
 
 #----------------------------------------------------------------------------
 
-def save_image_grid(img, fname, drange, grid_size):
+def save_image_grid(img, mask, contour_mask, fname, drange, grid_size):
     lo, hi = drange
     img = np.asarray(img, dtype=np.float32)
     img = (img - lo) * (255 / (hi - lo))
-    img = np.rint(img).clip(0, 255).astype(np.uint8)
+    img = np.rint(img).clip(0, 255)
+
+    mask = np.asarray(mask, dtype=np.float32)
+    mask = (mask + 1.0) / 2.0
+    mask = mask.clip(0, 1)
+
+    contour_mask = np.asarray(contour_mask, dtype=np.float32)
+    contour_mask = (contour_mask + 1.0) / 2.0
+    contour_mask = contour_mask.clip(0, 1)
 
     gw, gh = grid_size
     _N, C, H, W = img.shape
     img = img.reshape(gh, gw, C, H, W)
     img = img.transpose(0, 3, 1, 4, 2)
     img = img.reshape(gh * H, gw * W, C)
+
+    C1 = mask.shape[1]
+    mask = mask.reshape(gh, gw, C1, H, W)
+    mask = mask.transpose(0, 3, 1, 4, 2)
+    mask = mask.reshape(gh * H, gw * W, C1)
+
+    C2 = contour_mask.shape[1]
+    contour_mask = contour_mask.reshape(gh, gw, C2, H, W)
+    contour_mask = contour_mask.transpose(0, 3, 1, 4, 2)
+    contour_mask = contour_mask.reshape(gh * H, gw * W, C2)
+
+    pos_contour_mask = contour_mask[:,:,:1]
+    neg_contour_mask = contour_mask[:,:,1:2]
+
+    green_color = np.array([12, 240, 34], dtype=np.float32)[np.newaxis, np.newaxis, :]
+    blue_color = np.array([12, 14, 235], dtype=np.float32)[np.newaxis, np.newaxis, :]
+    red_color = np.array([240, 23, 34], dtype=np.float32)[np.newaxis, np.newaxis, :]
+    alpha = 0.4
+    img = ((1 - alpha * mask) * img + alpha * mask * blue_color)
+
+    alpha = 0.6
+    img = ((1 - alpha * pos_contour_mask) * img + alpha * pos_contour_mask * green_color)
+    img = ((1 - alpha * neg_contour_mask) * img + alpha * neg_contour_mask * red_color)
+
+    img = img.astype(np.uint8)
 
     assert C in [1, 3]
     if C == 1:
@@ -144,7 +177,8 @@ def training_loop(
     # Construct networks.
     if rank == 0:
         print('Constructing networks...')
-    common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
+    common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels,
+                         map_channels=training_set.map_channels)
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
@@ -161,8 +195,9 @@ def training_loop(
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
         c = torch.empty([batch_gpu, G.c_dim], device=device)
-        img = misc.print_module_summary(G, [z, c])
-        misc.print_module_summary(D, [img, c])
+        map = torch.empty([batch_gpu, G.map_channels, G.img_resolution, G.img_resolution], device = device)
+        contour = misc.print_module_summary(G, [z, map, c])
+        misc.print_module_summary(D, [torch.cat([map, contour], dim=1), c])
 
     # Setup augmentation.
     if rank == 0:
@@ -179,7 +214,7 @@ def training_loop(
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
     ddp_modules = dict()
-    for name, module in [('G_mapping', G.mapping), ('G_synthesis', G.synthesis), ('D', D), (None, G_ema), ('augment_pipe', augment_pipe)]:
+    for name, module in [('G_mapping', G.mapping), ('G_encoder', G.encoder), ('G_synthesis', G.synthesis), ('D', D), (None, G_ema), ('augment_pipe', augment_pipe)]:
         if (num_gpus > 1) and (module is not None) and len(list(module.parameters())) != 0:
             module.requires_grad_(True)
             module = torch.nn.parallel.DistributedDataParallel(module, device_ids=[device], broadcast_buffers=False)
@@ -214,15 +249,21 @@ def training_loop(
     # Export sample images.
     grid_size = None
     grid_z = None
+    grid_map = None
+    images = None
+    masks = None
     grid_c = None
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
+        grid_size, images, masks, contour_masks, labels = setup_snapshot_image_grid(training_set=training_set)
+        save_image_grid(images, masks, contour_masks, os.path.join(run_dir, 'reals.png'), drange=[-1,1], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        grid_images = torch.from_numpy(images).to(device)
+        grid_masks = torch.from_numpy(masks).to(device)
+        grid_map = torch.cat([grid_images, grid_masks], dim=1).split(batch_gpu)
+        contour_masks = torch.cat([G_ema(z=z, img=map, c=c, noise_mode='const').cpu() for z, map, c in zip(grid_z, grid_map, grid_c)]).numpy()
+        save_image_grid(images, masks, contour_masks, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
     # Initialize logs.
     if rank == 0:
@@ -255,8 +296,13 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
-            phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+            phase_real_img, phase_real_gt_mask, phase_real_contour, phase_real_c = next(training_set_iterator)
+            phase_real_img = phase_real_img.to(device).to(torch.float32)
+            phase_real_gt_mask = (phase_real_gt_mask.to(device).to(torch.float32))
+
+            phase_real_contour = (phase_real_contour.to(device).to(torch.float32)).split(batch_gpu)
+            phase_real_map = torch.cat([phase_real_img, phase_real_gt_mask], dim=1).split(batch_gpu)
+
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
@@ -276,10 +322,13 @@ def training_loop(
             phase.module.requires_grad_(True)
 
             # Accumulate gradients over multiple rounds.
-            for round_idx, (real_img, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c)):
+            for round_idx, (real_contour, real_map, real_c, gen_z, gen_c) in enumerate(zip(phase_real_contour, phase_real_map, phase_real_c, phase_gen_z, phase_gen_c)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
+                gen_map = torch.flip(real_map, dims=[0]).detach()
+                loss.accumulate_gradients(phase=phase.name, real_contour=real_contour, real_map=real_map,
+                                          real_c=real_c, gen_z=gen_z, gen_map=gen_map,
+                                          gen_c=gen_c, sync=sync, gain=gain)
 
             # Update weights.
             phase.module.requires_grad_(False)
@@ -344,14 +393,15 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+            contour_masks = torch.cat([G_ema(z=z, img=map, c=c, noise_mode='const').cpu() for z, map, c in zip(grid_z, grid_map, grid_c)]).numpy()
+            save_image_grid(images, masks, contour_masks, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
         cond_latest_snap = (latest_network_snapshot_ticks is not None) and cur_tick % latest_network_snapshot_ticks == 0 and cur_tick > 0
         cond_snap = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0) and cur_tick > 0
+
         if cond_latest_snap or cond_snap:
             snapshot_data = dict(training_set_kwargs=dict(training_set_kwargs))
             for name, module in [('G', G), ('D', D), ('G_ema', G_ema), ('augment_pipe', augment_pipe)]:
@@ -370,16 +420,16 @@ def training_loop(
                     pickle.dump(snapshot_data, f)
 
         # Evaluate metrics.
-        if (snapshot_data is not None) and (len(metrics) > 0) and cond_snap:
-            if rank == 0:
-                print('Evaluating metrics...')
-            for metric in metrics:
-                result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
-                if rank == 0:
-                    metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
-                stats_metrics.update(result_dict.results)
-        del snapshot_data # conserve memory
+        # if (snapshot_data is not None) and (len(metrics) > 0) and cond_snap:
+        #     if rank == 0:
+        #         print('Evaluating metrics...')
+        #     for metric in metrics:
+        #         result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
+        #             dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+        #         if rank == 0:
+        #             metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
+        #         stats_metrics.update(result_dict.results)
+        # del snapshot_data # conserve memory
 
         # Collect statistics.
         for phase in phases:

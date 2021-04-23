@@ -18,6 +18,15 @@ from cryptography.fernet import Fernet
 from torch_utils.misc import get_key, read_key
 import pickle
 
+import random
+import pickle
+import torch
+from torchvision import transforms
+from albumentations import KeypointParams, RandomBrightnessContrast, RGBShift, HorizontalFlip, Compose
+from training.transforms import ScaledCropNearMask
+from pathlib import Path
+
+
 try:
     import pyspng
 except ImportError:
@@ -265,3 +274,147 @@ class ImageFolderDatasetDescr(ImageFolderDataset):
         return labels
 
 #----------------------------------------------------------------------------
+
+class ContoursDataset(torch.utils.data.Dataset):
+    def __init__(self,
+        path,                   # Path to directory or zip.
+        resolution=None,        # Image resolution
+        name=None,
+        **super_kwargs,         # Additional arguments for the Dataset base class.
+    ):
+        super(ContoursDataset, self).__init__()
+        self._path = Path(path)
+        self._resolution = resolution
+        self._name = name
+
+        self._color_transform = Compose([
+            RandomBrightnessContrast(brightness_limit=(-0.25, 0.25), contrast_limit=(-0.15, 0.4), p=0.75),
+            RGBShift(r_shift_limit=10, g_shift_limit=10, b_shift_limit=10, p=0.75),
+        ], p=1.0)
+        additional_targets = {'soft_mask': 'image', 'contours_mask': 'image', 'obj_mask': 'mask'}
+        interpolation = cv2.INTER_LINEAR
+        self._transform = Compose([
+            ScaledCropNearMask(height=self._resolution, width=self._resolution, always_apply=True, interpolation=interpolation),
+            HorizontalFlip(),
+        ], p=1.0, additional_targets=additional_targets)
+
+        self._dataset_samples = self._load_samples(str(self._path / 'contours.json'))
+        if len(self._dataset_samples) == 0:
+            raise IOError('No image files found in the specified path')
+
+        self._name = self._path.stem if name is None else name
+
+    @property
+    def image_shape(self):
+        return (3, self._resolution, self._resolution)
+
+    @property
+    def label_shape(self):
+        return (0,)
+
+    @property
+    def label_dim(self):
+        return 0
+
+    @property
+    def has_labels(self):
+        return False
+
+    @property
+    def num_channels(self):
+        return 2
+
+    @property
+    def map_channels(self):
+        return 4
+
+    @property
+    def resolution(self):
+        return self._resolution
+
+    @property
+    def name(self):
+        return self._name
+
+    def _load_samples(self, json_file):
+        with open(json_file, 'r') as fp:
+            data = json.load(fp)
+
+        samples = []
+        for base_name in data:
+            imdata = data[base_name]
+            imname, maskname, contours_raw = imdata
+            if len(contours_raw) == 0:
+                print(f'Warning: image with name={base_name} has no contours!')
+                continue
+            contours = []
+            for contour in contours_raw:
+                is_positive = contour[0]
+                coords = contour[1]
+                contours.append((is_positive, coords))
+            samples.append((imname, maskname, contours))
+
+        return samples
+
+    def _get_filled_mask(self, contours, mask_shape):
+
+        pos_mask = np.zeros(mask_shape, dtype=np.uint8)
+        neg_mask = np.zeros(mask_shape, dtype=np.uint8)
+
+        for is_positive, coords in contours:
+            filled_mask = np.zeros(mask_shape, dtype=np.uint8)
+            if len(coords) > 2:
+                pts = [np.array(coords)[:, ::-1].astype(np.int32)]
+                cv2.fillPoly(filled_mask, pts=pts, color=255)
+            if is_positive:
+                pos_mask = np.maximum(pos_mask, filled_mask)
+            else:
+                neg_mask = np.maximum(neg_mask, filled_mask)
+
+        mask = np.stack((pos_mask, neg_mask), axis=2)
+        maskf = mask.astype(np.float32) / 255.
+
+        return maskf
+
+    def __getitem__(self, idx):
+        imname, maskname, contours = self._dataset_samples[idx]
+
+        image = cv2.imread(str(self._path / imname), 1)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        raw_mask = cv2.imread(str(self._path / maskname), 0)
+        mask = np.zeros_like(raw_mask)
+        mask[raw_mask > 128] = 1
+        obj_mask = np.array(mask, dtype=np.int32)
+        mask = mask.astype(np.float32)
+
+        if mask.shape[0] != image.shape[0] or mask.shape[1] != image.shape[1]:
+            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+            obj_mask = cv2.resize(obj_mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        image = self._color_transform(image=image)['image']
+        contours_mask = self._get_filled_mask(contours, mask.shape)
+
+        aug_out = self._transform(image=image, soft_mask=mask, contours_mask=contours_mask, obj_mask=obj_mask)
+        image = aug_out['image']
+        mask = aug_out['soft_mask']
+        contours_mask = aug_out['contours_mask']
+
+        image = 2 * (image.transpose(2, 0, 1) / 255. - 0.5)
+        contours_mask = contours_mask.transpose(2, 0, 1)
+        contours_mask = (2.0 * contours_mask - 1)
+        mask = (2.0 * mask - 1)
+        mask = mask[np.newaxis, :, :]
+
+        # cond_map = np.concatenate((image, contours_mask), axis=0)
+
+        label = np.zeros([1, 0], dtype=np.float32)
+
+        return image, mask, contours_mask, label[0]
+
+    def get_label(self, idx):
+        label = np.zeros([1, 0], dtype=np.float32)
+        return label[0]
+
+    def __len__(self):
+        return len(self._dataset_samples)

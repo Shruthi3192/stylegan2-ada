@@ -26,6 +26,8 @@ import cv2
 import random
 from cryptography.fernet import Fernet
 import itertools
+from pathlib import Path
+from os.path import splitext
 
 #----------------------------------------------------------------------------
 
@@ -490,7 +492,247 @@ def convert_dataset(
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()
 
+
+def load_contours(json_file):
+    with open(json_file, 'r') as fp:
+        data = json.load(fp)
+
+    samples = {}
+    for base_name in data:
+        imdata = data[base_name]
+        base_name = splitext(base_name)[0]
+        labels = {}
+        for obj_id in imdata:
+            contours_raw = imdata[obj_id]
+            if len(contours_raw) == 0:
+                print(f'Warning: image with name={base_name} has no contours!')
+                continue
+            contours = []
+            for contour in contours_raw:
+                is_positive = contour[0]
+                coords = contour[1]
+                contours.append((is_positive, coords))
+            obj_id = int(obj_id)
+            assert len(contours) > 0
+            labels[obj_id] = contours
+        if len(labels) > 0:
+            samples[base_name] = labels
+
+    return samples
+
+
+def load_berkeley_dataset(base_dir, contours_file='contours.json', images_dir_name='images', masks_dir_name='masks'):
+    base_dir = Path(base_dir)
+    images_dir = base_dir / images_dir_name
+    masks_dir = base_dir / masks_dir_name
+
+    dataset_samples = [x.name for x in sorted(images_dir.glob('*.*'))]
+    masks_paths = {x.stem: x.name for x in masks_dir.glob('*.*')}
+    dataset_samples = [(imname, masks_paths[Path(imname).stem]) for imname in dataset_samples]
+
+    contours_path = base_dir / contours_file
+    contours_data = load_contours(contours_path)
+    dataset_samples_n = []
+    for imname, masksname in dataset_samples:
+        base_name = Path(imname).stem
+        if base_name not in contours_data:
+            continue
+        image_contours = contours_data[base_name]
+        obj_keys = list(image_contours.keys())
+        assert len(obj_keys) == 1
+        contours = image_contours[obj_keys[0]]
+        dataset_samples_n.append((imname, masksname, contours))
+    dataset_samples = dataset_samples_n
+    dataset_samples = [(str(images_dir / imname), str(masks_dir / maskname), contours)
+                       for imname, maskname, contours in dataset_samples]
+
+    def load_sample_func(item):
+        image_path = item[0]
+        mask_path = item[1]
+        contours = item[2]
+
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        instances_mask = cv2.imread(mask_path)[:, :, 0].astype(np.int32)
+        instances_mask[instances_mask == 128] = -1
+        instances_mask[instances_mask > 128] = 1
+
+        return image, instances_mask, contours
+
+    return dataset_samples, load_sample_func
+
+
+def load_grabcut_dataset(base_dir, contours_file='contours.json'):
+    return load_berkeley_dataset(base_dir, contours_file=contours_file,
+                                 images_dir_name='data_GT', masks_dir_name='boundary_GT')
+
+def load_davis_dataset(base_dir, contours_file='contours.json'):
+    dataset_samples, _ = load_berkeley_dataset(base_dir, contours_file=contours_file,
+                                            images_dir_name='img', masks_dir_name='gt')
+
+    def load_sample_func(item):
+        image_path = item[0]
+        mask_path = item[1]
+        contours = item[2]
+
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        instances_mask = np.max(cv2.imread(mask_path).astype(np.int32), axis=2)
+        instances_mask[instances_mask > 0] = 1
+
+        return image, instances_mask, contours
+
+    return dataset_samples, load_sample_func
+
+
+def load_openimages_dataset(base_dir, split='test', contours_file='contours.json', exclude_file=None):
+    base_dir = Path(base_dir)
+    split_path = base_dir / split
+    images_path = split_path / 'images'
+    masks_path = split_path / 'masks'
+    exclude_file = split_path / exclude_file if exclude_file is not None else None
+
+    if split == 'test' and exclude_file is None:
+        print('Exclude file is not specified for OpenImages(test), trying to use `exclude.txt`')
+        exclude_file = split_path / 'exclude.txt'
+        if not exclude_file.exists():
+            msg = 'Failed to find `exclude.txt` file, RefinedOI images is not excluded from OpenImages(test)'
+            print(msg)
+
+    anno_path = str(split_path / f'{split}-annotations-object-segmentation.csv')
+    if os.path.exists(anno_path):
+        with open(anno_path, 'r') as f:
+            data = f.read().splitlines()
+    else:
+        raise RuntimeError(f'Can\'t find annotations at {anno_path}')
+
+    images_exclude = None
+    if exclude_file is not None:
+        with open(str(exclude_file), 'r') as fp:
+            images_exclude = fp.read().splitlines()
+        images_exclude = set(images_exclude)
+
+    image_id_to_masks = {}
+    excluded = 0
+    for line in data[1:]:
+        parts = line.split(',')
+        if '.png' in parts[0]:
+            mask_name = parts[0]
+            image_id = parts[1]
+        else:
+            mask_name = parts[1]
+            image_id = parts[2]
+        if images_exclude is not None and image_id in images_exclude:
+            excluded += 1
+            continue
+        if image_id not in image_id_to_masks:
+            image_id_to_masks[image_id] = []
+        image_id_to_masks[image_id].append(mask_name)
+
+    if excluded > 0:
+        print(f'Number of excluded masks: {excluded}')
+
+    image_id_to_masks = image_id_to_masks
+    dataset_samples = list(image_id_to_masks.keys())
+
+    contours_path = split_path / contours_file
+    contours_data = load_contours(contours_path)
+    dataset_samples_n = []
+    for image_id in dataset_samples:
+        if image_id not in contours_data:
+            continue
+        dataset_samples_n.append(image_id)
+    dataset_samples = dataset_samples_n
+    dataset_samples_n = []
+    for image_id in dataset_samples:
+        masknames = image_id_to_masks[image_id]
+        objects_contours = contours_data[image_id]
+        imname = str(images_path / f'{image_id}.jpg')
+        only_objects = objects_contours.keys()
+        masks_and_contours = [(masknames[obj_index], objects_contours[obj_index]) for obj_index in only_objects]
+        for maskname, contours in masks_and_contours:
+            maskname = str(masks_path / maskname)
+            dataset_samples_n.append((imname, maskname, contours))
+    dataset_samples = dataset_samples_n
+
+    def load_sample_func(item):
+        image_path = item[0]
+        mask_path = item[1]
+        contours = item[2]
+
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        mask = cv2.imread(mask_path, 0)
+        object_mask = mask > 0
+        instances_mask = np.array(object_mask, dtype=np.int32)
+
+        return image, instances_mask, contours
+
+    return dataset_samples, load_sample_func
+
 #----------------------------------------------------------------------------
+def prepare_contours_dataset():
+
+    datasets = [(load_berkeley_dataset, '/media/denemmy/hdd/data/interactive_segmentation/RefinedIO', 'contours.json'),
+                (load_davis_dataset, '/media/denemmy/hdd/data/interactive_segmentation/DAVIS', 'contours.json'),
+                (load_grabcut_dataset, '/media/denemmy/hdd/data/interactive_segmentation/GrabCut', 'contours.json'),
+                (load_berkeley_dataset, '/media/denemmy/hdd/data/interactive_segmentation/Berkeley', 'contours.json'),
+                (load_openimages_dataset, '/media/denemmy/hdd/data/open_images', 'val', 'contours_val.json'),
+                (load_openimages_dataset, '/media/denemmy/hdd/data/open_images', 'test', 'OpenImages_Test_v2.json')]
+
+    # datasets = [(load_openimages_dataset, '/media/denemmy/hdd/data/open_images', 'val', 'contours_val.json')]
+
+    output_dir = Path('/media/denemmy/hdd/data/interactive_segmentation/contours_dataset')
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    img_dirname = 'images'
+    mask_dirname = 'masks'
+
+    output_imgs_dir = output_dir / img_dirname
+    output_mask_dir = output_dir / mask_dirname
+
+    output_imgs_dir.mkdir(exist_ok=True, parents=True)
+    output_mask_dir.mkdir(exist_ok=True, parents=True)
+
+    all_samples = []
+    output_samples = {}
+    index = 0
+    for items in datasets:
+        load_op = items[0]
+        base_dir = items[1]
+        args = items[1:]
+        samples, load_samples_func = load_op(*args)
+        print(f'{base_dir}: {len(samples)}')
+        images_unique = {}
+        for item in samples:
+            image, instances_mask, contours = load_samples_func(item)
+            img_path = item[0]
+            imname = f'{img_dirname}/{index:04d}.jpg'
+            maskname = f'{mask_dirname}/{index:04d}.png'
+            store_img = True
+            if img_path in images_unique:
+                imname = images_unique[img_path]
+                store_img = False
+            else:
+                images_unique[img_path] = imname
+
+            mask = np.array(instances_mask)
+            mask[instances_mask < 0] = 128
+            mask[instances_mask > 0] = 255
+            mask = mask.astype(np.uint8)
+
+            if store_img:
+                cv2.imwrite(str(output_dir / imname), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(output_dir / maskname), mask)
+
+            output_samples[f'{index:04d}'] = (imname, maskname, contours)
+
+            index += 1
+
+    with open(str(output_dir / 'contours.json'), 'w') as fp:
+        json.dump(output_samples, fp, indent=4)
+
 
 if __name__ == "__main__":
-    convert_dataset() # pylint: disable=no-value-for-parameter
+    prepare_contours_dataset() # pylint: disable=no-value-for-parameter

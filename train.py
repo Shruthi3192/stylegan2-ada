@@ -54,6 +54,8 @@ def setup_training_loop_kwargs(
     kimg       = None, # Override training duration: <int>
     batch      = None, # Override batch size: <int>
     fmaps      = None, # Override size of the feature maps: <float>
+    zdim       = None, # Override input z dim
+    wdim       = None, # Override input w dim
 
     # Discriminator augmentation.
     aug        = None, # Augmentation mode: 'ada' (default), 'noaug', 'fixed'
@@ -86,6 +88,12 @@ def setup_training_loop_kwargs(
 
     if snap is None:
         snap = 1000
+
+    if zdim is None:
+        zdim = 512
+    if wdim is None:
+        wdim = 512
+
     if latest_snap is None:
         latest_snap = 50
     assert isinstance(snap, int)
@@ -119,8 +127,8 @@ def setup_training_loop_kwargs(
             key = read_key(key_url[7:])
         else:
             key = get_key('https://raw.githubusercontent.com/' + key_url)
-    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDatasetDescr',
-                                               path=data, use_labels=True, max_size=None, xflip=mirror,
+    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ContoursDataset',
+                                               path=data, max_size=None, use_labels=False, xflip=mirror,
                                                resolution=resolution, key=key)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
@@ -197,7 +205,7 @@ def setup_training_loop_kwargs(
         desc += f'-fmaps{fmaps:g}'
         spec.fmaps = fmaps
 
-    args.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator', z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict())
+    args.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator', z_dim=zdim, w_dim=wdim, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict())
     args.D_kwargs = dnnlib.EasyDict(class_name='training.networks.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
     args.G_kwargs.synthesis_kwargs.channel_base = args.D_kwargs.channel_base = int(spec.fmaps * 32768)
     args.G_kwargs.synthesis_kwargs.channel_max = args.D_kwargs.channel_max = 512
@@ -440,6 +448,8 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--kimg', help='Override training duration', type=int, metavar='INT')
 @click.option('--batch', help='Override batch size', type=int, metavar='INT')
 @click.option('--fmaps', help='Override feature maps size', type=float)
+@click.option('--zdim', help='Override z dim', type=int, metavar='INT')
+@click.option('--wdim', help='Override w dim', type=int, metavar='INT')
 
 # Discriminator augmentation.
 @click.option('--aug', help='Augmentation mode [default: ada]', type=click.Choice(['noaug', 'ada', 'fixed']))

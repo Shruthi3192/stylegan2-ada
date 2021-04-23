@@ -60,12 +60,12 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
     # Load data.
-    images, masks, contours_masks, labels = zip(*[training_set[i] for i in grid_indices])
-    return (gw, gh), np.stack(images), np.stack(masks), np.stack(contours_masks), np.stack(labels)
+    images, masks, labels = zip(*[training_set[i] for i in grid_indices])
+    return (gw, gh), np.stack(images), np.stack(masks), np.stack(labels)
 
 #----------------------------------------------------------------------------
 
-def save_image_grid(img, mask, contour_mask, fname, drange, grid_size):
+def save_image_grid(img, mask, fname, drange, grid_size):
     lo, hi = drange
     img = np.asarray(img, dtype=np.float32)
     img = (img - lo) * (255 / (hi - lo))
@@ -74,10 +74,6 @@ def save_image_grid(img, mask, contour_mask, fname, drange, grid_size):
     mask = np.asarray(mask, dtype=np.float32)
     mask = (mask + 1.0) / 2.0
     mask = mask.clip(0, 1)
-
-    contour_mask = np.asarray(contour_mask, dtype=np.float32)
-    contour_mask = (contour_mask + 1.0) / 2.0
-    contour_mask = contour_mask.clip(0, 1)
 
     gw, gh = grid_size
     _N, C, H, W = img.shape
@@ -90,23 +86,11 @@ def save_image_grid(img, mask, contour_mask, fname, drange, grid_size):
     mask = mask.transpose(0, 3, 1, 4, 2)
     mask = mask.reshape(gh * H, gw * W, C1)
 
-    C2 = contour_mask.shape[1]
-    contour_mask = contour_mask.reshape(gh, gw, C2, H, W)
-    contour_mask = contour_mask.transpose(0, 3, 1, 4, 2)
-    contour_mask = contour_mask.reshape(gh * H, gw * W, C2)
-
-    pos_contour_mask = contour_mask[:,:,:1]
-    neg_contour_mask = contour_mask[:,:,1:2]
-
     green_color = np.array([12, 240, 34], dtype=np.float32)[np.newaxis, np.newaxis, :]
     blue_color = np.array([12, 14, 235], dtype=np.float32)[np.newaxis, np.newaxis, :]
     red_color = np.array([240, 23, 34], dtype=np.float32)[np.newaxis, np.newaxis, :]
     alpha = 0.4
-    img = ((1 - alpha * mask) * img + alpha * mask * blue_color)
-
-    alpha = 0.6
-    img = ((1 - alpha * pos_contour_mask) * img + alpha * pos_contour_mask * green_color)
-    img = ((1 - alpha * neg_contour_mask) * img + alpha * neg_contour_mask * red_color)
+    img = ((1 - alpha * mask) * img + alpha * mask * green_color)
 
     img = img.astype(np.uint8)
 
@@ -249,21 +233,18 @@ def training_loop(
     # Export sample images.
     grid_size = None
     grid_z = None
-    grid_map = None
     images = None
-    masks = None
+    grid_cond_map = None
     grid_c = None
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, masks, contour_masks, labels = setup_snapshot_image_grid(training_set=training_set)
-        save_image_grid(images, masks, contour_masks, os.path.join(run_dir, 'reals.png'), drange=[-1,1], grid_size=grid_size)
+        grid_size, images, masks, labels = setup_snapshot_image_grid(training_set=training_set)
+        save_image_grid(images, masks, os.path.join(run_dir, 'reals.png'), drange=[-1,1], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-        grid_images = torch.from_numpy(images).to(device)
-        grid_masks = torch.from_numpy(masks).to(device)
-        grid_map = torch.cat([grid_images, grid_masks], dim=1).split(batch_gpu)
-        contour_masks = torch.cat([G_ema(z=z, img=map, c=c, noise_mode='const').cpu() for z, map, c in zip(grid_z, grid_map, grid_c)]).numpy()
-        save_image_grid(images, masks, contour_masks, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        grid_cond_map = torch.from_numpy(images).to(device).split(batch_gpu)
+        gen_masks = torch.cat([G_ema(z=z, img=map, c=c, noise_mode='const').cpu() for z, map, c in zip(grid_z, grid_cond_map, grid_c)]).numpy()
+        save_image_grid(images, gen_masks, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
     # Initialize logs.
     if rank == 0:
@@ -296,13 +277,9 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_gt_mask, phase_real_contour, phase_real_c = next(training_set_iterator)
-            phase_real_img = phase_real_img.to(device).to(torch.float32)
-            phase_real_gt_mask = (phase_real_gt_mask.to(device).to(torch.float32))
-
-            phase_real_contour = (phase_real_contour.to(device).to(torch.float32)).split(batch_gpu)
-            phase_real_map = torch.cat([phase_real_img, phase_real_gt_mask], dim=1).split(batch_gpu)
-
+            phase_real_img, phase_real_gt_mask, phase_real_c = next(training_set_iterator)
+            phase_real_img = phase_real_img.to(device).to(torch.float32).split(batch_gpu)
+            phase_real_gt_mask = (phase_real_gt_mask.to(device).to(torch.float32)).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
@@ -322,12 +299,12 @@ def training_loop(
             phase.module.requires_grad_(True)
 
             # Accumulate gradients over multiple rounds.
-            for round_idx, (real_contour, real_map, real_c, gen_z, gen_c) in enumerate(zip(phase_real_contour, phase_real_map, phase_real_c, phase_gen_z, phase_gen_c)):
+            for round_idx, (real_img, real_gt_mask, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_real_gt_mask, phase_real_c, phase_gen_z, phase_gen_c)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                gen_map = torch.flip(real_map, dims=[0]).detach()
-                loss.accumulate_gradients(phase=phase.name, real_contour=real_contour, real_map=real_map,
-                                          real_c=real_c, gen_z=gen_z, gen_map=gen_map,
+                gen_cond = torch.flip(real_img, dims=[0]).detach()
+                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_gt_mask=real_gt_mask,
+                                          real_c=real_c, gen_z=gen_z, gen_cond=gen_cond,
                                           gen_c=gen_c, sync=sync, gain=gain)
 
             # Update weights.
@@ -393,8 +370,8 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            contour_masks = torch.cat([G_ema(z=z, img=map, c=c, noise_mode='const').cpu() for z, map, c in zip(grid_z, grid_map, grid_c)]).numpy()
-            save_image_grid(images, masks, contour_masks, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+            gen_masks = torch.cat([G_ema(z=z, img=map, c=c, noise_mode='const').cpu() for z, map, c in zip(grid_z, grid_cond_map, grid_c)]).numpy()
+            save_image_grid(images, gen_masks, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None

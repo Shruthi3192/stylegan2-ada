@@ -322,11 +322,11 @@ class ContoursDataset(torch.utils.data.Dataset):
 
     @property
     def num_channels(self):
-        return 2
+        return 1
 
     @property
     def map_channels(self):
-        return 4
+        return 3
 
     @property
     def resolution(self):
@@ -377,7 +377,7 @@ class ContoursDataset(torch.utils.data.Dataset):
         return maskf
 
     def __getitem__(self, idx):
-        imname, maskname, contours = self._dataset_samples[idx]
+        imname, maskname, _ = self._dataset_samples[idx]
 
         image = cv2.imread(str(self._path / imname), 1)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -393,24 +393,160 @@ class ContoursDataset(torch.utils.data.Dataset):
             obj_mask = cv2.resize(obj_mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
 
         image = self._color_transform(image=image)['image']
-        contours_mask = self._get_filled_mask(contours, mask.shape)
 
-        aug_out = self._transform(image=image, soft_mask=mask, contours_mask=contours_mask, obj_mask=obj_mask)
+        aug_out = self._transform(image=image, soft_mask=mask, obj_mask=obj_mask)
         image = aug_out['image']
         mask = aug_out['soft_mask']
-        contours_mask = aug_out['contours_mask']
 
         image = 2 * (image.transpose(2, 0, 1) / 255. - 0.5)
-        contours_mask = contours_mask.transpose(2, 0, 1)
-        contours_mask = (2.0 * contours_mask - 1)
         mask = (2.0 * mask - 1)
         mask = mask[np.newaxis, :, :]
 
-        # cond_map = np.concatenate((image, contours_mask), axis=0)
+        label = np.zeros([1, 0], dtype=np.float32)
+
+        return image, mask, label[0]
+
+    def get_label(self, idx):
+        label = np.zeros([1, 0], dtype=np.float32)
+        return label[0]
+
+    def __len__(self):
+        return len(self._dataset_samples)
+
+
+class OpenImagesDataset(torch.utils.data.Dataset):
+    def __init__(self,
+        path,                   # Path to directory or zip.
+        resolution=None,        # Image resolution
+        name=None,
+        **super_kwargs,         # Additional arguments for the Dataset base class.
+    ):
+        super(OpenImagesDataset, self).__init__()
+        self._path = Path(path)
+        self._resolution = resolution
+        self._name = name
+
+        self._color_transform = Compose([
+            RandomBrightnessContrast(brightness_limit=(-0.25, 0.25), contrast_limit=(-0.15, 0.4), p=0.75),
+            RGBShift(r_shift_limit=10, g_shift_limit=10, b_shift_limit=10, p=0.75),
+        ], p=1.0)
+        additional_targets = {'soft_mask': 'image', 'obj_mask': 'mask'}
+        interpolation = cv2.INTER_LINEAR
+        self._transform = Compose([
+            ScaledCropNearMask(height=self._resolution, width=self._resolution, always_apply=True, interpolation=interpolation),
+            HorizontalFlip(),
+        ], p=1.0, additional_targets=additional_targets)
+
+        test_dataset_samples = self._load_samples(self._path, split='test')
+        val_dataset_samples = self._load_samples(self._path, split='val')
+        self._dataset_samples = test_dataset_samples + val_dataset_samples
+        if len(self._dataset_samples) == 0:
+            raise IOError('No image files found in the specified path')
+
+        self._name = self._path.stem if name is None else name
+
+    @property
+    def image_shape(self):
+        return (3, self._resolution, self._resolution)
+
+    @property
+    def label_shape(self):
+        return (0,)
+
+    @property
+    def label_dim(self):
+        return 0
+
+    @property
+    def has_labels(self):
+        return False
+
+    @property
+    def num_channels(self):
+        return 1
+
+    @property
+    def map_channels(self):
+        return 3
+
+    @property
+    def resolution(self):
+        return self._resolution
+
+    @property
+    def name(self):
+        return self._name
+
+    def _load_samples(self, base_dir, split):
+
+        split_path = base_dir / split
+        images_dirname = f'{split}/images'
+        masks_dirname = f'{split}/masks'
+
+        anno_path = str(split_path / f'{split}-annotations-object-segmentation.csv')
+        if os.path.exists(anno_path):
+            with open(anno_path, 'r') as f:
+                data = f.read().splitlines()
+        else:
+            raise RuntimeError(f'Can\'t find annotations at {anno_path}')
+
+        image_id_to_masks = {}
+        for line in data[1:]:
+            parts = line.split(',')
+            if '.png' in parts[0]:
+                mask_name = parts[0]
+                image_id = parts[1]
+            else:
+                mask_name = parts[1]
+                image_id = parts[2]
+            if image_id not in image_id_to_masks:
+                image_id_to_masks[image_id] = []
+            image_id_to_masks[image_id].append(mask_name)
+
+        image_id_to_masks = image_id_to_masks
+        dataset_samples = list(image_id_to_masks.keys())
+
+        dataset_samples_n = []
+        for image_id in dataset_samples:
+            masknames = image_id_to_masks[image_id]
+            imname = f'{images_dirname}/{image_id}.jpg'
+            for maskname in masknames:
+                maskname = f'{masks_dirname}/{maskname}'
+                dataset_samples_n.append((imname, maskname))
+        dataset_samples = dataset_samples_n
+        return dataset_samples
+
+    def __getitem__(self, idx):
+        imname, maskname = self._dataset_samples[idx]
+
+        image_path = str(self._path / imname)
+        mask_path = str(self._path / maskname)
+
+        image = cv2.imread(image_path, 1)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        mask = cv2.imread(mask_path, 0)
+        mask = mask > 0
+        obj_mask = np.array(mask, dtype=np.int32)
+        mask = mask.astype(np.float32)
+
+        if mask.shape[0] != image.shape[0] or mask.shape[1] != image.shape[1]:
+            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+            obj_mask = cv2.resize(obj_mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        image = self._color_transform(image=image)['image']
+
+        aug_out = self._transform(image=image, soft_mask=mask, obj_mask=obj_mask)
+        image = aug_out['image']
+        mask = aug_out['soft_mask']
+
+        image = 2 * (image.transpose(2, 0, 1) / 255. - 0.5)
+        mask = (2.0 * mask - 1)
+        mask = mask[np.newaxis, :, :]
 
         label = np.zeros([1, 0], dtype=np.float32)
 
-        return image, mask, contours_mask, label[0]
+        return image, mask, label[0]
 
     def get_label(self, idx):
         label = np.zeros([1, 0], dtype=np.float32)

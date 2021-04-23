@@ -707,7 +707,7 @@ class Generator(nn.Module):
 
     def __init__(self, max_res_log2, latent_size=512, fmap_base=8192, fmap_max=512,
                  base_scale_h=4, base_scale_w=4, channels=3, use_activation=False,
-                 use_pn=True, label_size=0, mix_style=True, mix_prob=0.9):
+                 use_pn=True, label_size=0, mix_style=True, mix_prob=0.9, stylegan2_orig_cond=False):
         super(Generator, self).__init__()
 
         self.fmap_base = fmap_base
@@ -726,6 +726,7 @@ class Generator(nn.Module):
         self.use_pn = use_pn
         self.mix_style = mix_style
         self.mix_prob = mix_prob
+        self.stylegan2_orig_cond = stylegan2_orig_cond
 
         self.constant_tensor = nn.Parameter(torch.Tensor(1, self.num_features(1), self.base_scale_h, self.base_scale_w))
         nn.init.constant_(self.constant_tensor, 1)
@@ -749,9 +750,9 @@ class Generator(nn.Module):
     def build_mapping(self):
 
         layers = []
-        in_units = self.latent_size
-        if self.use_pn:
-            layers.append(PixelNorm())
+        in_units = self.latent_size + self.label_size if self.stylegan2_orig_cond else self.latent_size
+        # if self.use_pn:
+        #     layers.append(PixelNorm())
         for i in range(8):
             layers.append(nn.Linear(in_units, self.latent_size))
             in_units = self.latent_size
@@ -787,7 +788,10 @@ class Generator(nn.Module):
         return net_block
 
     def build_conditional_embedding(self):
-        embedding = nn.Embedding(self.label_size, self.latent_size)
+        if self.stylegan2_orig_cond:
+            embedding = nn.Linear(self.label_size, self.latent_size)
+        else:
+            embedding = nn.Embedding(self.label_size, self.latent_size)
         return embedding
 
     def run_style_mixing(self, w):
@@ -803,7 +807,7 @@ class Generator(nn.Module):
             w = [w] * (2*self.max_res_log2 - 2)
         return w
 
-    def run_trunc(self, w, latent_avg, trunc_psi=0.7, trunc_cutoff=8):
+    def run_trunc(self, w, latent_avg, trunc_psi=0.7, trunc_cutoff=None):
         if latent_avg is not None and not self.training:
             w_trunc = []
             if trunc_cutoff is None:
@@ -821,10 +825,18 @@ class Generator(nn.Module):
 
     def run_conditional(self, w, label):
         if self.label_size > 0:
-            label = label.view((-1,)).detach()
-            w_class = self.conditional_embedding(label)
-            w = w + w_class
+            if self.stylegan2_orig_cond:
+                w_cond = self.conditional_embedding(label)
+                w_cond = self.normalize_2nd_moment(w_cond) if self.use_pn else w_cond
+                w = torch.cat([w, w_cond], dim=1)
+            else:
+                label = label.view((-1,)).detach()
+                w_class = self.conditional_embedding(label)
+                w = w + w_class
         return w
+
+    def normalize_2nd_moment(self, x, dim=1, eps=1e-8):
+        return x * (x.square().mean(dim=dim, keepdim=True) + eps).rsqrt()
 
     def forward(self, noise, label=None, latent_avg=None, latents_only=False,
                 input_is_latent=False, addnoise=None, trunc_psi=0.5, trunc_cutoff=None):
@@ -834,8 +846,14 @@ class Generator(nn.Module):
             if not isinstance(w, list):
                 w = [w] * (2*self.max_res_log2 - 2)
         else:
-            w = self.mapping(noise)
-            w = self.run_conditional(w, label)
+            if self.stylegan2_orig_cond:
+                w = self.normalize_2nd_moment(noise) if self.use_pn else noise
+                w = self.run_conditional(w, label)
+                w = self.mapping(w)
+            else:
+                w = self.normalize_2nd_moment(noise) if self.use_pn else noise
+                w = self.mapping(w)
+                w = self.run_conditional(w, label)
             w = self.run_style_mixing(w)
             w = self.run_trunc(w, latent_avg, trunc_psi, trunc_cutoff)
 
@@ -968,7 +986,7 @@ def init_generator(max_res_log2, latent_size=512, fmap_base=2*128*128, fmap_max=
                    label_size=0):
     netG = Generator(max_res_log2, latent_size=latent_size, fmap_base=fmap_base, fmap_max=fmap_max,
                      base_scale_h=4, base_scale_w=4, label_size=label_size,
-                     channels=channels, use_activation=False, use_pn=True)
+                     channels=channels, use_activation=False, use_pn=True, stylegan2_orig_cond=True)
 
     mapping_lr_mult = 0.01
     if mapping_lr_mult != 1.0:
@@ -1044,8 +1062,12 @@ def convert(
 
 
     for i in range(8):
-        new_dict[f'mapping.{2*i+1}.weight_orig']    = old_dict[f'mapping.fc{i}.weight']
-        new_dict[f'mapping.{2*i+1}.bias_orig']      = old_dict[f'mapping.fc{i}.bias']
+        new_dict[f'mapping.{2*i}.weight_orig']    = old_dict[f'mapping.fc{i}.weight']
+        new_dict[f'mapping.{2*i}.bias_orig']      = old_dict[f'mapping.fc{i}.bias']
+
+    if G.init_kwargs.c_dim > 0:
+        new_dict['conditional_embedding.weight_orig'] = old_dict[f'mapping.embed.weight']
+        new_dict['conditional_embedding.bias']   = old_dict[f'mapping.embed.bias']
 
     fp32_dict = {}
     for name, param in new_dict.items():
@@ -1070,9 +1092,14 @@ def compare_generation(G, netG, latent_avg, addnoise):
     latent_avg = latent_avg.to(device)
 
     label = torch.zeros([1, G.c_dim], device=device) if G.c_dim > 0 else None
+    if G.c_dim > 0:
+        class_file = '/media/user/c192784f-e992-4c1e-9acb-711282eac532/data/photos_descriptors/danil/descriptor.pkl'
+        with open(class_file, 'rb') as fp:
+            class_v = pickle.load(fp)
+        label[0, :] = torch.from_numpy(class_v)
     truncation_psi = 0.75
 
-    seeds = range(100,200)
+    seeds = range(100, 200)
 
     for seed_idx, seed in enumerate(seeds):
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
@@ -1080,7 +1107,7 @@ def compare_generation(G, netG, latent_avg, addnoise):
         with torch.no_grad():
             z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device).to(torch.float)
             img1 = G(z, label, truncation_psi=truncation_psi, noise_mode='const')
-            img2 = netG(z, label=None, latent_avg=latent_avg, addnoise=addnoise, trunc_psi=truncation_psi, trunc_cutoff=None)
+            img2 = netG(z, label=label, latent_avg=latent_avg, addnoise=addnoise, trunc_psi=truncation_psi, trunc_cutoff=None)
 
             img1 = (img1.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).cpu().numpy()[0]
             img2 = (img2.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).cpu().numpy()[0]

@@ -1190,11 +1190,10 @@ class HighResolutionNet(torch.nn.Module):
 
 
 class GradualStyleBlock(torch.nn.Module):
-    def __init__(self, in_c, out_c, steps):
+    def __init__(self, in_c, out_c, steps, fmap_mult = 1.5):
         super(GradualStyleBlock, self).__init__()
         self.out_c = out_c
         modules = []
-        fmap_mult = 1.5
         ch1 = min(int(fmap_mult * in_c), out_c)
         modules += [BiasAct(in_c, bias=True),
                     Conv2dLayer(in_c, ch1, kernel_size=3, down=2, bias=False)]
@@ -1224,7 +1223,7 @@ class Encoder(torch.nn.Module):
         super(Encoder, self).__init__()
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
-        self.backbone = self.get_hrnet_w18_small_v2(img_channels)
+        self.backbone = self.get_hrnet_w18(img_channels)
 
         self.styles = torch.nn.ModuleList()
         self.style_count = 2 * self.img_resolution_log2 - 2
@@ -1233,20 +1232,25 @@ class Encoder(torch.nn.Module):
         if self.img_resolution_log2 == 10:
             self.coarse_ind = 3
             self.middle_ind = 7
+            self.high_ind = 14
         elif self.img_resolution_log2 == 9:
             self.coarse_ind = 3
             self.middle_ind = 7
+            self.high_ind = 12
         else:
             self.coarse_ind = 3
             self.middle_ind = 7
+            self.high_ind = 10
 
         for i in range(self.style_count):
             if i < self.coarse_ind:
                 style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-1], w_dim, self.img_resolution_log2-5)
             elif i < self.middle_ind:
                 style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-2], w_dim, self.img_resolution_log2-4)
-            else:
+            elif i < self.high_ind:
                 style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-3], w_dim, self.img_resolution_log2-3)
+            else:
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-4], w_dim, self.img_resolution_log2-2)
             self.styles.append(style)
 
     def get_hrnet_w18_small_v2(self, img_channels):
@@ -1263,13 +1267,27 @@ class Encoder(torch.nn.Module):
 
         return model
 
+    def get_hrnet_w18(self, img_channels):
+
+        stage_modules = [1, 1, 4, 3]
+        stage_num_branches = [1, 2, 3, 4]
+        stage_num_blocks = [[4], [4, 4], [4, 4, 4], [4, 4, 4, 4]]
+        stage_num_channels = [[64], [18, 36], [18, 36, 72], [18, 36, 72, 144]]
+        stage_block_types = ['BOTTLENECK', 'BASIC', 'BASIC', 'BASIC']
+
+        model = HighResolutionNet(img_channels=img_channels, stage_modules=stage_modules,
+                                  stage_num_branches=stage_num_branches, stage_num_blocks=stage_num_blocks,
+                                  stage_num_channels=stage_num_channels, stage_block_types=stage_block_types)
+
+        return model
+
     def forward(self, ws, x):
         feats = self.backbone(x)
         # feats - \4, \8, \16, \32
 
         latents = []
 
-        _, c2, c3, c4 = feats
+        c1, c2, c3, c4 = feats
 
         for j in range(self.coarse_ind):
             latents.append(self.styles[j](c4))
@@ -1277,8 +1295,11 @@ class Encoder(torch.nn.Module):
         for j in range(self.coarse_ind, self.middle_ind):
             latents.append(self.styles[j](c3))
 
-        for j in range(self.middle_ind, self.style_count):
+        for j in range(self.middle_ind, self.high_ind):
             latents.append(self.styles[j](c2))
+
+        for j in range(self.high_ind, self.style_count):
+            latents.append(self.styles[j](c1))
 
         out = torch.stack(latents, dim=1)
         return ws + out

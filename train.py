@@ -127,7 +127,7 @@ def setup_training_loop_kwargs(
             key = read_key(key_url[7:])
         else:
             key = get_key('https://raw.githubusercontent.com/' + key_url)
-    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ContoursDataset',
+    args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.OpenImagesDataset',
                                                path=data, max_size=None, use_labels=False, xflip=mirror,
                                                resolution=resolution, key=key)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)

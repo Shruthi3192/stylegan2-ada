@@ -674,16 +674,19 @@ def load_openimages_dataset(base_dir, split='test', contours_file='contours.json
 #----------------------------------------------------------------------------
 def prepare_contours_dataset():
 
-    datasets = [(load_berkeley_dataset, '/media/denemmy/hdd/data/interactive_segmentation/RefinedIO', 'contours.json'),
-                (load_davis_dataset, '/media/denemmy/hdd/data/interactive_segmentation/DAVIS', 'contours.json'),
-                (load_grabcut_dataset, '/media/denemmy/hdd/data/interactive_segmentation/GrabCut', 'contours.json'),
-                (load_berkeley_dataset, '/media/denemmy/hdd/data/interactive_segmentation/Berkeley', 'contours.json'),
-                (load_openimages_dataset, '/media/denemmy/hdd/data/open_images', 'val', 'contours_val.json'),
-                (load_openimages_dataset, '/media/denemmy/hdd/data/open_images', 'test', 'OpenImages_Test_v2.json')]
+    base_dir = '/media/denemmy/hdd/data'
+    base_dir = '/media/hdd/data'
+
+    datasets = [(load_berkeley_dataset, f'{base_dir}/interactive_segmentation/RefinedOI', 'contours.json'),
+                (load_davis_dataset, f'{base_dir}/interactive_segmentation/DAVIS', 'contours.json'),
+                (load_grabcut_dataset, f'{base_dir}/interactive_segmentation/GrabCut', 'contours.json'),
+                (load_berkeley_dataset, f'{base_dir}/interactive_segmentation/Berkeley', 'contours.json'),
+                (load_openimages_dataset, f'{base_dir}/interactive_segmentation/openimages', 'val', 'contours_val.json'),
+                (load_openimages_dataset, f'{base_dir}/interactive_segmentation/openimages', 'test', 'OpenImages_Test_v2.json')]
 
     # datasets = [(load_openimages_dataset, '/media/denemmy/hdd/data/open_images', 'val', 'contours_val.json')]
 
-    output_dir = Path('/media/denemmy/hdd/data/interactive_segmentation/contours_dataset')
+    output_dir = Path(f'{base_dir}/interactive_segmentation/contours_dataset')
     output_dir.mkdir(exist_ok=True, parents=True)
 
     img_dirname = 'images'

@@ -288,15 +288,18 @@ class SynthesisLayer(torch.nn.Module):
         resolution,                     # Resolution of this layer.
         kernel_size     = 3,            # Convolution kernel size.
         up              = 1,            # Integer upsampling factor.
+        down            = 1,            # Integer downsampling factor.
         use_noise       = True,         # Enable noise input?
         activation      = 'lrelu',      # Activation function: 'relu', 'lrelu', etc.
         resample_filter = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
         conv_clamp      = None,         # Clamp the output of convolution layers to +-X, None = disable clamping.
         channels_last   = False,        # Use channels_last format for the weights?
+        bias            = True
     ):
         super().__init__()
         self.resolution = resolution
         self.up = up
+        self.down = down
         self.use_noise = use_noise
         self.activation = activation
         self.conv_clamp = conv_clamp
@@ -310,11 +313,15 @@ class SynthesisLayer(torch.nn.Module):
         if use_noise:
             self.register_buffer('noise_const', torch.randn([resolution, resolution]))
             self.noise_strength = torch.nn.Parameter(torch.zeros([]))
-        self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
+        self.use_bias = bias
+        if self.use_bias:
+            self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
+        else:
+            self.bias = None
 
     def forward(self, x, w, noise_mode='random', fused_modconv=True, gain=1):
         assert noise_mode in ['random', 'const', 'none']
-        in_resolution = self.resolution // self.up
+        in_resolution = self.resolution // self.up * self.down
         misc.assert_shape(x, [None, self.weight.shape[1], in_resolution, in_resolution])
         styles = self.affine(w)
 
@@ -325,12 +332,15 @@ class SynthesisLayer(torch.nn.Module):
             noise = self.noise_const * self.noise_strength
 
         flip_weight = (self.up == 1) # slightly faster
-        x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, up=self.up,
+        x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, up=self.up, down=self.down,
             padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
 
-        act_gain = self.act_gain * gain
-        act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
-        x = bias_act.bias_act(x, self.bias.to(x.dtype), act=self.activation, gain=act_gain, clamp=act_clamp)
+        if self.use_bias:
+            act_gain = self.act_gain * gain
+            act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
+            x = bias_act.bias_act(x, self.bias.to(x.dtype), act=self.activation, gain=act_gain, clamp=act_clamp)
+        elif gain != 1:
+            x = x * gain
         return x
 
 #----------------------------------------------------------------------------
@@ -528,7 +538,7 @@ class Generator(torch.nn.Module):
 
     def forward(self, z, img, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-        ws = self.encoder(ws, img)
+        ws = self.encoder(img, ws[:,0])
         img = self.synthesis(ws, **synthesis_kwargs)
         return img
 
@@ -767,10 +777,24 @@ class Discriminator(torch.nn.Module):
 
 #----------------------------------------------------------------------------
 
+def conv3x3_mod(in_planes, out_planes, w_dim, resolution, down=1, bias=False):
+    """3x3 convolution with zero padding"""
+    conv = SynthesisLayer(in_planes, out_planes, w_dim=w_dim, resolution=resolution, kernel_size=3,
+                          activation='linear', down=down, bias=bias)
+    return conv
+
 
 def conv3x3(in_planes, out_planes, down=1, bias=False):
     """3x3 convolution with zero padding"""
     conv = Conv2dLayer(in_planes, out_planes, kernel_size=3, down=down, bias=bias)
+    return conv
+
+
+def conv1x1_mod(in_planes, out_planes, w_dim, resolution, down=1, bias=False):
+    """1x1 convolution"""
+    conv = Conv2dLayer(in_planes, out_planes, kernel_size=1, down=down, bias=bias)
+    conv = SynthesisLayer(in_planes, out_planes, w_dim=w_dim, resolution=resolution, kernel_size=3,
+                          activation='linear', down=down, bias=bias)
     return conv
 
 
@@ -780,29 +804,39 @@ def conv1x1(in_planes, out_planes, down=1, bias=False):
     return conv
 
 
+class SequentialW(torch.nn.Sequential):
+    def forward(self, input, latent):
+        for module in self:
+            if isinstance(module, BiasAct):
+                input = module(input)
+            else:
+                input = module(input, latent)
+        return input
+
+
 class BasicBlock(torch.nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, inplanes, planes, w_dim, resolution, stride=1, downsample=None):
         super(BasicBlock, self).__init__()
         self.relu1 = BiasAct(inplanes, bias=True)
-        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.conv1 = conv3x3_mod(inplanes, planes, w_dim, resolution, stride)
         self.relu2 = BiasAct(planes, bias=True)
-        self.conv2 = conv3x3(planes, planes)
+        self.conv2 = conv3x3_mod(planes, planes, w_dim, resolution)
         self.downsample = downsample
         self.stride = stride
 
-    def forward(self, x):
+    def forward(self, x, w):
         residual = x
 
         out = self.relu1(x)
-        out = self.conv1(out)
+        out = self.conv1(out, w)
 
         out = self.relu2(out)
-        out = self.conv2(out)
+        out = self.conv2(out, w)
 
         if self.downsample is not None:
-            residual = self.downsample(x)
+            residual = self.downsample(x, w)
 
         out = (out + residual) / np.sqrt(2.0)
 
@@ -812,31 +846,31 @@ class BasicBlock(torch.nn.Module):
 class Bottleneck(torch.nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, inplanes, planes, w_dim, resolution, stride=1, downsample=None):
         super(Bottleneck, self).__init__()
         self.relu1 = BiasAct(inplanes, bias=True)
-        self.conv1 = conv1x1(inplanes, planes)
+        self.conv1 = conv1x1_mod(inplanes, planes, w_dim, resolution)
         self.relu2 = BiasAct(planes, bias=True)
-        self.conv2 = conv3x3(planes, planes, stride)
+        self.conv2 = conv3x3_mod(planes, planes, w_dim, resolution, stride)
         self.relu3 = BiasAct(planes, bias=True)
-        self.conv3 = conv1x1(planes, planes * self.expansion)
+        self.conv3 = conv1x1_mod(planes, planes * self.expansion, w_dim, resolution)
         self.downsample = downsample
         self.stride = stride
 
-    def forward(self, x):
+    def forward(self, x, w):
         residual = x
 
         out = self.relu1(x)
-        out = self.conv1(out)
+        out = self.conv1(out, w)
 
         out = self.relu2(out)
-        out = self.conv2(out)
+        out = self.conv2(out, w)
 
         out = self.relu3(out)
-        out = self.conv3(out)
+        out = self.conv3(out, w)
 
         if self.downsample is not None:
-            residual = self.downsample(x)
+            residual = self.downsample(x, w)
 
         out = (out + residual) / np.sqrt(2.0)
 
@@ -845,14 +879,16 @@ class Bottleneck(torch.nn.Module):
 
 class HighResolutionModule(torch.nn.Module):
     def __init__(self, num_branches, blocks, num_blocks, num_inchannels,
-                 num_channels, multi_scale_output=True):
+                 num_channels, w_dim, resolution, multi_scale_output=True):
         super(HighResolutionModule, self).__init__()
         self._check_branches(
             num_branches, blocks, num_blocks, num_inchannels, num_channels)
 
         self.num_inchannels = num_inchannels
+        self.resolution = resolution
         self.num_branches = num_branches
 
+        self.w_dim = w_dim
         self.multi_scale_output = multi_scale_output
 
         self.branches = self._make_branches(
@@ -880,31 +916,33 @@ class HighResolutionModule(torch.nn.Module):
             raise ValueError(error_msg)
 
     def _make_one_branch(self, branch_index, block, num_blocks, num_channels,
-                         stride=1):
+                         resolution, stride=1):
         downsample = None
         if stride != 1 or \
                 self.num_inchannels[branch_index] != num_channels[branch_index] * block.expansion:
-            downsample = conv1x1(self.num_inchannels[branch_index],
-                                 num_channels[branch_index] * block.expansion,
-                                 down=stride, bias=False)
+            downsample = conv1x1_mod(self.num_inchannels[branch_index],
+                                     num_channels[branch_index] * block.expansion,
+                                     self.w_dim, resolution,
+                                     down=stride, bias=False)
 
         layers = []
         layers.append(block(self.num_inchannels[branch_index],
-                            num_channels[branch_index], stride, downsample))
+                            num_channels[branch_index], self.w_dim, resolution, stride, downsample))
         self.num_inchannels[branch_index] = \
             num_channels[branch_index] * block.expansion
         for i in range(1, num_blocks[branch_index]):
             layers.append(block(self.num_inchannels[branch_index],
-                                num_channels[branch_index]))
+                                num_channels[branch_index], self.w_dim, resolution))
 
-        return torch.nn.Sequential(*layers)
+        return SequentialW(*layers)
 
     def _make_branches(self, num_branches, block, num_blocks, num_channels):
         branches = []
 
         for i in range(num_branches):
+            resolution = self.resolution // (2 ** i)
             branches.append(
-                self._make_one_branch(i, block, num_blocks, num_channels))
+                self._make_one_branch(i, block, num_blocks, num_channels, resolution))
 
         return torch.nn.ModuleList(branches)
 
@@ -949,12 +987,12 @@ class HighResolutionModule(torch.nn.Module):
     def get_num_inchannels(self):
         return self.num_inchannels
 
-    def forward(self, x):
+    def forward(self, x, w):
         if self.num_branches == 1:
-            return [self.branches[0](x[0])]
+            return [self.branches[0](x[0], w)]
 
         for i in range(self.num_branches):
-            x[i] = self.branches[i](x[i])
+            x[i] = self.branches[i](x[i], w)
 
         x_fuse = []
         for i in range(len(self.fuse_layers)):
@@ -983,40 +1021,24 @@ blocks_dict = {
 
 
 class EncoderMainBlock(torch.nn.Module):
-    def __init__(self, in_channels, channels, from_rgb=False):
+    def __init__(self, in_channels, channels, w_dim, resolution, from_rgb=False):
         super().__init__()
 
         self.from_rgb = from_rgb
         if not from_rgb:
             self.relu1 = BiasAct(in_channels, bias=True)
 
-        self.conv1 = Conv2dLayer(in_channels, channels, kernel_size=3, bias=False, down=2)
+        self.conv1 = SynthesisLayer(in_channels, channels, w_dim=w_dim, resolution=resolution,
+                                    down=2, kernel_size=3, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, w):
 
         y = x
 
         if not self.from_rgb:
             y = self.relu1(y)
 
-        y = self.conv1(y)
-
-        return y
-
-
-class DecoderMainBlock(torch.nn.Module):
-    def __init__(self, in_channels, channels):
-        super().__init__()
-
-        self.relu1 = BiasAct(in_channels, bias=True)
-        self.conv1 = Conv2dLayer(in_channels, channels, kernel_size=3, bias=False, up=2)
-
-    def forward(self, x):
-
-        y = x
-
-        y = self.relu1(y)
-        y = self.conv1(y)
+        y = self.conv1(y, w)
 
         return y
 
@@ -1025,7 +1047,7 @@ class HighResolutionNet(torch.nn.Module):
 
     def __init__(self, img_channels, stage_modules, stage_num_branches,
                  stage_num_blocks, stage_num_channels,
-                 stage_block_types):
+                 stage_block_types, w_dim, resolution):
         super(HighResolutionNet, self).__init__()
 
         # hrnet params
@@ -1034,18 +1056,23 @@ class HighResolutionNet(torch.nn.Module):
         self.stage_num_blocks = stage_num_blocks
         self.stage_num_channels = stage_num_channels
         self.stage_block_types = stage_block_types
+        self.w_dim = w_dim
+        self.resolution = resolution
 
         # stem net
         stem_num_channels = self.stage_num_channels[0][0]
-        self.encoder1 = EncoderMainBlock(in_channels=img_channels, channels=stem_num_channels//2, from_rgb=True)
+        self.encoder1 = EncoderMainBlock(in_channels=img_channels, channels=stem_num_channels//2, w_dim=w_dim,
+                                         resolution=resolution//2, from_rgb=True)
         self.encoder2 = EncoderMainBlock(in_channels=stem_num_channels//2,
-                                         channels=stem_num_channels)
+                                         channels=stem_num_channels, w_dim=w_dim, resolution=resolution//4)
+
+        base_resolution = resolution//4
 
         num_channels = self.stage_num_channels[0][0]
         block = blocks_dict[self.stage_block_types[0]]
         num_blocks = self.stage_num_blocks[0][0]
 
-        self.layer1 = self._make_layer(block, stem_num_channels, num_channels, num_blocks)
+        self.layer1 = self._make_layer(block, stem_num_channels, num_channels, num_blocks, base_resolution)
         stage1_out_channel = block.expansion * num_channels
 
         num_channels = self.stage_num_channels[1]
@@ -1057,7 +1084,7 @@ class HighResolutionNet(torch.nn.Module):
         self.stage2, pre_stage_channels = self._make_stage(
             self.stage_modules[1], self.stage_num_branches[1],
             self.stage_num_blocks[1], self.stage_num_channels[1],
-            num_channels, self.stage_block_types[1])
+            num_channels, self.stage_block_types[1], base_resolution)
 
         num_channels = self.stage_num_channels[2]
         block = blocks_dict[self.stage_block_types[2]]
@@ -1068,7 +1095,7 @@ class HighResolutionNet(torch.nn.Module):
         self.stage3, pre_stage_channels = self._make_stage(
             self.stage_modules[2], self.stage_num_branches[2],
             self.stage_num_blocks[2], self.stage_num_channels[2],
-            num_channels, self.stage_block_types[2])
+            num_channels, self.stage_block_types[2], base_resolution)
 
         num_channels = self.stage_num_channels[3]
         block = blocks_dict[self.stage_block_types[3]]
@@ -1079,7 +1106,7 @@ class HighResolutionNet(torch.nn.Module):
         self.stage4, pre_stage_channels = self._make_stage(
             self.stage_modules[3], self.stage_num_branches[3],
             self.stage_num_blocks[3], self.stage_num_channels[3],
-            num_channels, self.stage_block_types[3], multi_scale_output=True)
+            num_channels, self.stage_block_types[3], base_resolution, multi_scale_output=True)
 
     def _make_transition_layer(
             self, num_channels_pre_layer, num_channels_cur_layer):
@@ -1109,22 +1136,23 @@ class HighResolutionNet(torch.nn.Module):
 
         return torch.nn.ModuleList(transition_layers)
 
-    def _make_layer(self, block, inplanes, planes, blocks, stride=1):
+    def _make_layer(self, block, inplanes, planes, blocks, resolution, stride=1):
         downsample = None
         if stride != 1 or inplanes != planes * block.expansion:
-            downsample = conv1x1(inplanes, planes * block.expansion,
-                                 down=stride, bias=False)
+            downsample = conv1x1_mod(inplanes, planes * block.expansion,
+                                     w_dim=self.w_dim, resolution=resolution,
+                                     down=stride, bias=False)
 
         layers = []
-        layers.append(block(inplanes, planes, stride, downsample))
+        layers.append(block(inplanes, planes, self.w_dim, resolution, stride, downsample))
         inplanes = planes * block.expansion
         for i in range(1, blocks):
-            layers.append(block(inplanes, planes))
+            layers.append(block(inplanes, planes, self.w_dim, resolution))
 
-        return torch.nn.Sequential(*layers)
+        return SequentialW(*layers)
 
     def _make_stage(self, num_modules, num_branches, num_blocks, num_channels, num_inchannels,
-                    block_type, multi_scale_output=True):
+                    block_type, base_resolution, multi_scale_output=True):
         block = blocks_dict[block_type]
 
         modules = []
@@ -1140,20 +1168,20 @@ class HighResolutionNet(torch.nn.Module):
                                      num_blocks,
                                      num_inchannels,
                                      num_channels,
+                                     self.w_dim,
+                                     base_resolution,
                                      reset_multi_scale_output)
             )
             num_inchannels = modules[-1].get_num_inchannels()
 
-        return torch.nn.Sequential(*modules), num_inchannels
+        return SequentialW(*modules), num_inchannels
 
-    def forward(self, x):
+    def forward(self, x, w):
 
-        # x = torch.cat([x, mask], dim=1)
+        x = self.encoder1(x, w)
+        x = self.encoder2(x, w)
 
-        x = self.encoder1(x)
-        x = self.encoder2(x)
-
-        x = self.layer1(x)
+        x = self.layer1(x, w)
 
         x_list = []
         for i in range(self.stage_num_branches[1]):
@@ -1161,7 +1189,7 @@ class HighResolutionNet(torch.nn.Module):
                 x_list.append(self.transition1[i](x))
             else:
                 x_list.append(x)
-        y_list = self.stage2(x_list)
+        y_list = self.stage2(x_list, w)
 
         x_list = []
         for i in range(self.stage_num_branches[2]):
@@ -1172,7 +1200,7 @@ class HighResolutionNet(torch.nn.Module):
                     x_list.append(self.transition2[i](y_list[-1]))
             else:
                 x_list.append(y_list[i])
-        y_list = self.stage3(x_list)
+        y_list = self.stage3(x_list, w)
 
         x_list = []
         for i in range(self.stage_num_branches[3]):
@@ -1183,36 +1211,39 @@ class HighResolutionNet(torch.nn.Module):
                     x_list.append(self.transition3[i](y_list[-1]))
             else:
                 x_list.append(y_list[i])
-        x = self.stage4(x_list)
+        x = self.stage4(x_list, w)
         feats = x
 
         return feats
 
 
 class GradualStyleBlock(torch.nn.Module):
-    def __init__(self, in_c, out_c, steps, fmap_mult = 1.5):
+    def __init__(self, in_c, w_dim, resolution, steps, fmap_mult=1.5):
         super(GradualStyleBlock, self).__init__()
-        self.out_c = out_c
+        self.out_c = w_dim
         modules = []
-        ch1 = min(int(fmap_mult * in_c), out_c)
+        ch1 = min(int(fmap_mult * in_c), self.out_c)
+        resol = resolution // 2
         modules += [BiasAct(in_c, bias=True),
-                    Conv2dLayer(in_c, ch1, kernel_size=3, down=2, bias=False)]
+                    SynthesisLayer(in_c, ch1, w_dim, resol, kernel_size=3, down=2, bias=False)]
         for i in range(steps - 1):
             ch0 = ch1
-            ch1 = min(int(fmap_mult * ch0), out_c)
+            ch1 = min(int(fmap_mult * ch0), self.out_c)
+            resol = resol // 2
             modules += [
                 BiasAct(ch0, bias=True),
-                Conv2dLayer(ch0, ch1, kernel_size=3, down=2, bias=False)
+                SynthesisLayer(ch0, ch1, w_dim, resol, kernel_size=3, down=2, bias=False)
             ]
-        self.convs = torch.nn.Sequential(*modules)
+        self.convs = SequentialW(*modules)
+        self.last_conv_ch = ch1
         lr_multiplier = 0.01
         linear = [BiasAct(ch1, bias=True),
-                  FullyConnectedLayer(ch1, out_c, activation='linear', lr_multiplier=lr_multiplier)]
+                  FullyConnectedLayer(ch1, self.out_c, activation='linear', lr_multiplier=lr_multiplier)]
         self.linear = torch.nn.Sequential(*linear)
 
-    def forward(self, x):
-        x = self.convs(x)
-        x = x.view(-1, self.out_c)
+    def forward(self, x, w):
+        x = self.convs(x, w)
+        x = x.view(-1, self.last_conv_ch)
         x = self.linear(x)
         return x
 
@@ -1223,7 +1254,7 @@ class Encoder(torch.nn.Module):
         super(Encoder, self).__init__()
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
-        self.backbone = self.get_hrnet_w18(img_channels)
+        self.backbone = self.get_hrnet_w18(img_channels, w_dim, img_resolution)
 
         self.styles = torch.nn.ModuleList()
         self.style_count = 2 * self.img_resolution_log2 - 2
@@ -1244,16 +1275,20 @@ class Encoder(torch.nn.Module):
 
         for i in range(self.style_count):
             if i < self.coarse_ind:
-                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-1], w_dim, self.img_resolution_log2-5)
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-1], w_dim,
+                                          self.img_resolution//32, self.img_resolution_log2-5)
             elif i < self.middle_ind:
-                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-2], w_dim, self.img_resolution_log2-4)
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-2], w_dim,
+                                          self.img_resolution//16, self.img_resolution_log2-4)
             elif i < self.high_ind:
-                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-3], w_dim, self.img_resolution_log2-3)
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-3], w_dim,
+                                          self.img_resolution//8, self.img_resolution_log2-3)
             else:
-                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-4], w_dim, self.img_resolution_log2-2)
+                style = GradualStyleBlock(self.backbone.stage_num_channels[-1][-4], w_dim,
+                                          self.img_resolution//4, self.img_resolution_log2-2)
             self.styles.append(style)
 
-    def get_hrnet_w18_small_v2(self, img_channels):
+    def get_hrnet_w18_small_v2(self, img_channels, w_dim, resolution):
 
         stage_modules = [1, 1, 3, 2]
         stage_num_branches = [1, 2, 3, 4]
@@ -1263,11 +1298,12 @@ class Encoder(torch.nn.Module):
 
         model = HighResolutionNet(img_channels=img_channels, stage_modules=stage_modules,
                                   stage_num_branches=stage_num_branches, stage_num_blocks=stage_num_blocks,
-                                  stage_num_channels=stage_num_channels, stage_block_types=stage_block_types)
+                                  stage_num_channels=stage_num_channels, stage_block_types=stage_block_types,
+                                  w_dim=w_dim, resolution=resolution)
 
         return model
 
-    def get_hrnet_w18(self, img_channels):
+    def get_hrnet_w18(self, img_channels, w_dim, resolution):
 
         stage_modules = [1, 1, 4, 3]
         stage_num_branches = [1, 2, 3, 4]
@@ -1277,12 +1313,30 @@ class Encoder(torch.nn.Module):
 
         model = HighResolutionNet(img_channels=img_channels, stage_modules=stage_modules,
                                   stage_num_branches=stage_num_branches, stage_num_blocks=stage_num_blocks,
-                                  stage_num_channels=stage_num_channels, stage_block_types=stage_block_types)
+                                  stage_num_channels=stage_num_channels, stage_block_types=stage_block_types,
+                                  w_dim=w_dim, resolution=resolution)
 
         return model
 
-    def forward(self, ws, x):
-        feats = self.backbone(x)
+    def get_hrnet_by_params(self, img_channels, w_dim, resolution,
+                            base_channels=18, stem_channels=64):
+
+        bc = base_channels
+        stage_modules = [1, 1, 4, 3]
+        stage_num_branches = [1, 2, 3, 4]
+        stage_num_blocks = [[4], [4, 4], [4, 4, 4], [4, 4, 4, 4]]
+        stage_num_channels = [[stem_channels], [bc, bc*2], [bc, bc*2, bc*4], [bc, bc*2, bc*4, bc*8]]
+        stage_block_types = ['BOTTLENECK', 'BASIC', 'BASIC', 'BASIC']
+
+        model = HighResolutionNet(img_channels=img_channels, stage_modules=stage_modules,
+                                  stage_num_branches=stage_num_branches, stage_num_blocks=stage_num_blocks,
+                                  stage_num_channels=stage_num_channels, stage_block_types=stage_block_types,
+                                  w_dim=w_dim, resolution=resolution)
+
+        return model
+
+    def forward(self, x, w):
+        feats = self.backbone(x, w)
         # feats - \4, \8, \16, \32
 
         latents = []
@@ -1290,35 +1344,39 @@ class Encoder(torch.nn.Module):
         c1, c2, c3, c4 = feats
 
         for j in range(self.coarse_ind):
-            latents.append(self.styles[j](c4))
+            latents.append(self.styles[j](c4, w))
 
         for j in range(self.coarse_ind, self.middle_ind):
-            latents.append(self.styles[j](c3))
+            latents.append(self.styles[j](c3, w))
 
         for j in range(self.middle_ind, self.high_ind):
-            latents.append(self.styles[j](c2))
+            latents.append(self.styles[j](c2, w))
 
         for j in range(self.high_ind, self.style_count):
-            latents.append(self.styles[j](c1))
+            latents.append(self.styles[j](c1, w))
 
         out = torch.stack(latents, dim=1)
-        return ws + out
+        return out
 
 
 if __name__ == '__main__':
     from matplotlib import pyplot as plt
-    device = torch.device('cuda:0')
+    device = torch.device('cpu')
 
-    z_dim = 512
-    w_dim = 512
+    z_dim = 128
+    w_dim = 128
     resol = 256
 
-    G = Generator(z_dim=z_dim, c_dim=0, w_dim=w_dim, img_resolution=resol, img_channels=3).to(device)
-    input = torch.randn((1, 3, resol, resol), device=device)
+    img_channels = 1
+    map_channels = 3
+
+    G = Generator(z_dim=z_dim, c_dim=0, w_dim=w_dim, img_resolution=resol, img_channels=img_channels,
+                  map_channels=map_channels).to(device)
+    cond_map = torch.randn((1, map_channels, resol, resol), device=device)
     z = torch.randn((1, z_dim), device=device)
 
     with torch.no_grad():
-        output = G(z=z, img=input, c=None)
+        output = G(z=z, img=cond_map, c=None)
 
     output = output.cpu().numpy()
     img = np.transpose(output[0], (1, 2, 0))
